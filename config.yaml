@@ -1,0 +1,451 @@
+# 两个程序共享的相机参数
+camera:
+  device: 4
+  exposure: 170
+  # 关闭自动白平衡后固定的色温（K）；应按当前灯光和相机实测调整。
+  white_balance_temperature: 4600
+  width: null
+  height: null
+
+# capture.py 仅读取 camera 和 capture
+capture:
+  # 可填具体图片文件；若填目录，每次按 p 自动生成 capture_时间戳.png
+  save: /home/liuchaoyi/recon/assets/cali_norm_pics
+  # 可填具体 .mp4/.avi 文件；若填目录，每次按 v 自动生成无损 FFV1 AVI，避免标定色差。
+  video_save: /home/liuchaoyi/recon/assets/cali_lightfield_videos
+
+# calibrate_camera.py 使用普通黑白棋盘格进行单目标定
+# 行列数指“内角点”数量，不是黑白方块数量
+calibration:
+  board_cols: 6
+  board_rows: 6
+  square_size_mm: 25.0
+  min_samples: 12
+  output: camera_calibration.yaml
+
+# get_surface.py 仅读取 camera 和 get_surface
+get_surface:
+  # 恢复优化前的 base-plus 权重，优先保证分割与曲面质量。
+  model: facebook/sam2.1-hiera-base-plus
+  # 编译固定形状的视觉编码器；短 memory 时也编译 attention/decoder。
+  # 会话字典和 frame index 等 Python 状态仍保持 eager。
+  torch_compile: true
+  # 局部接触不会快速改变整个传感器外轮廓。按下方间隔更新 SAM 和
+  # 依赖该 mask 的整体边缘配对；中间帧复用整体几何。相机色差、
+  # 光场参数、残差拟合和局部形变仍每帧更新。
+  sam_frame_interval: 1
+  # 2 是能稳定追踪的最短记忆；1 帧时只剩首帧 conditioning memory，
+  # 实测后续 mask 会退化为空，不能用于重建。
+  sam_memory_frames: 4
+  save: null
+  no_display: false
+  max_frames: 0
+
+  # SAM mask 后处理：闭运算填小洞、开运算去噪、外轮廓填洞、高斯平滑边缘
+  mask_refine:
+    enabled: true
+    close_kernel: 9   # 越大越能填大空洞，边缘也会略膨胀
+    open_kernel: 9    # 去掉细小毛刺；设 0 关闭
+    blur_kernel: 20    # 边缘平滑强度；设 0 关闭
+    keep_largest: true
+
+  # 点云处理
+  # surface提取prompt
+  prompts:
+    surface:
+      positive:
+        - [120, 30]
+        - [150, 60]
+        - [180, 30]
+        - [400, 30]
+        - [430, 60]
+        - [460, 30]
+        - [230, 260]
+      # negative: 
+      #   - [320, 470]
+  # 删除轮廓中靠近中轴线的点：丢掉 u ∈ [u0-d, u0+d]
+  center_band_d: 45
+
+  # 侧边缘空间重建：首个有效帧联合标定旋转和 x 平移，之后锁定外参；
+  # 实时阶段用动态规划配对，并以二阶差分平滑的线性最小二乘求共享 Y/Z。
+  # 内参与畸变参数从 camera_calibration.yaml（或 calibration.output）读取
+  reconstruction:
+    calibration_file: assets/camera_calibration.yaml
+    s1: 11.0          # 右边缘平面 x=s1 > 0
+    s2: -11.0         # 左边缘平面 x=s2 < 0
+    # get_surface.py 的整体重建点云窗口。
+    show_point_cloud: true
+    # 前三个几何/观测网格互相独立，columns 均包含左右边界点；后两个网格
+    # 定义规范曲面上的 B/M 表示，不表示新的三维几何顶点。
+    # 整体几何负责边缘配对和基础 XYZ，控制最昂贵的 O(rows^2) 动态规划。
+    geometry_grid:
+      rows: 120
+      columns: 52
+    # 光场网格由整体几何插值得到，用于物理光场计算和 GPU 光栅化。
+    lightfield_grid:
+      rows: 120
+      columns: 52
+    # 高分辨率观测网格从全分辨率色差图采样，并用于局部形变求解与显示。
+    observation_grid:
+      rows: 400
+      columns: 202
+    # B/M 场在 observation_grid 上采集拟合样本；这里仅配置三次 B 样条控制系数网格。
+    residual_coefficient_grid:
+      rows: 128
+      columns: 64
+    # B/M 控制系数在运行时先展开到该规范曲面纹理，再按连续 ST 映射回原图。
+    residual_texture_grid:
+      # direct 的静态 B 和 delta B 保持 observation_grid 原生分辨率，避免在线
+      # 展开时再次下采样并丢失四侧照明产生的细条带。
+      rows: 400
+      columns: 202
+    # 用实测左右轮廓修正三维重投影 UV。二阶项只抑制逐行抖动，常量和线性误差不受罚。
+    uv_boundary_smooth_lambda: 10.0
+    # 鲁棒平滑阈值（去畸变像素），避免个别错误轮廓点把内部 UV 拉偏。
+    uv_boundary_huber_delta_px: 2.0
+    # 当前坐标下要求 dz/dh 非递减；这等价于整体中心框架不发生局部反曲。
+    # 约束通过加权保序投影实施，并精确保留曲线两个端点。
+    curve_convexity: increasing
+
+# 已知半径标定球：使用当前背景方法生成色差，不需要无接触参考图。
+normal_calibration:
+  # 必须改成实际标定球半径，单位 mm；程序拒绝 null 或非正数。
+  sphere_radius_mm: 5
+  # 全部图片先共同拟合本次标定会话的 Bsession。物理路径同时把 raw M 正交化为
+  # M_session；几何背景路径由各图 XYZ 生成神经场或缓存插值背景，只拟合低频会话修正。
+  images: /home/liuchaoyi/recon/assets/cali_norm_pics/*.png
+  output_files:
+    physical_residual: assets/normal_calibration/normal_lut.npz
+    direct_fit: assets/normal_calibration/normal_lut_direct_fit.npz
+    direct_fit_3: assets/normal_calibration/normal_lut_direct_fit_3.npz
+    geometry_cache: assets/normal_calibration/normal_lut_geometry_cache.npz
+  observation_dir: assets/normal_calibration/observations
+  generated_map_dir: assets/normal_calibration/maps
+  verification_dir: assets/normal_calibration/verification
+  # 人工椭圆会逐张保存；之后普通重跑直接复用，加 --edit-manual-regions 可全部重画。
+  manual_regions_file: assets/normal_calibration/manual_ellipses.yaml
+  manual_editor:
+    # 最终 LUT 使用比人工椭圆向内缩小该像素数的区域，避免手画边界误差。
+    edge_margin_pixels: 2
+  # 人工跳过的图片不会进入 LUT。
+  # 这是阻止数据明显不足的硬下限；实际建议采集并通过 30--50 张。
+  minimum_accepted_images: 10
+  minimum_samples_per_node: 5
+  maximum_rms_angle_degrees: 5.0
+  # p 为横轴、q 为纵轴的 RGB 样本叠加诊断图边长；即使通过图片不足也会生成。
+  pq_visualization_resolution: 640
+  # 只影响诊断图坐标范围，不删除 LUT 训练样本。隐藏最外侧 0.5% 左右的坡度
+  # 离群点，并在图中报告 hidden 数量和 raw-max。
+  pq_visualization_percentile: 99.5
+  # Bsession 只使用人工椭圆以外的区域；不再运行阈值、连通域或圆拟合。
+  bsession_contact_exclusion:
+    dilation_pixels: 12
+    minimum_background_fraction: 0.2
+
+# 实时局部形变重建。input/output 只属于 recon-local 离线命令，不在这里配置。
+local_reconstruction:
+  enabled: true
+  calibration_files:
+    physical_residual: assets/normal_calibration/normal_lut.npz
+    direct_fit: assets/normal_calibration/normal_lut_direct_fit.npz
+    direct_fit_3: assets/normal_calibration/normal_lut_direct_fit_3.npz
+    geometry_cache: assets/normal_calibration/normal_lut_geometry_cache.npz
+  # physical_residual 下，uniform 是严格等权最小二乘，uniform_huber 只增加 Huber。
+  # 几何背景模式不做逐帧 M 拟合；该值仅用于与法向 LUT 保持同一元数据配置。
+  # 各种方法生成的法向 LUT 不通用；切换后必须重新运行 calibrate_norm.py。
+  residual_method: uniform_huber
+  # 对线性 dRGB 使用 max(abs(dR),abs(dG),abs(dB)) 度量。inner 内坡度固定为零，
+  # inner 到 outer 之间用 smoothstep 平滑放开，outer 外完整保留 LUT 坡度。
+  # 该保护在整个有效曲面上应用：0.08 内 p=q=0，0.08--0.15 平滑
+  # 放开，0.15 外完整保留 LUT 坡度。
+  zero_color_protection:
+    inner_radius: 0.08
+    outer_radius: 0.15
+  # 从启动无触碰帧建立每个观测位置的残差中心与 RGB 鲁棒尺度。低分数点
+  # 才是“可信无接触”：它们使 p=q=0（PQ0），并增加软 d=0 先验
+  # （Dprior0）。求解域始终是完整曲面，不再用方形掩膜外硬置零。
+  no_contact_constraints:
+    enabled: true
+    minimum_startup_valid_fraction: 0.8
+    minimum_channel_scale: 0.005
+    trusted_score_threshold: 2.5
+    # 强响应及其邻域不得被判为无接触，保护真实接触中心的弱色差区。
+    contact_guard_score_threshold: 5.0
+    contact_guard_radius_pixels: 20
+    surface_edge_margin_pixels: 4
+    slope_confidence: 1.0
+    # 面积归一化的软 d=0 权重；不是硬置零，不会把掩膜边界刻成方格。
+    displacement_zero_lambda_per_mm2: 0.25
+  # 3D 曲面 Turbo 色表范围：-range 到 +range mm，超出范围截断。
+  depth_color_range_mm: 2.0
+  # 只放大 Open3D 中沿法向的显示位移；求解结果、诊断和保存数据均保持真实毫米值。
+  deformation_geometry_gain: 1.0
+  # 坐标轴颜色较亮，默认隐藏以降低视觉干扰。
+  show_coordinate_frame: false
+  show_surface_mesh: true
+  # 每帧同步更新 Open3D 曲面网格。
+  mesh_update_interval: 1
+  # 每帧先用频域 Poisson 积分直接恢复全局低频位移，再让 PCG 只精修
+  # 曲率和非均匀权重误差。这样突变不需要依靠后续多帧逐渐收敛。
+  spectral_poisson_initialization_iterations: 2
+  # 对中心差分正规方程的四个奇偶子格使用频域 Poisson 预条件；
+  # 比无预条件 LSMR 更快消除决定整体形变的低频误差。
+  linear_solver: spectral_pcg
+  lsmr_atol: 1.0e-6
+  lsmr_btol: 1.0e-6
+  # recon-local 离线命令仍允许 LSMR 完整收敛。
+  lsmr_max_iterations: null
+  # 仅实时路径使用的精修预算；PCG 达到容差后会提前停止。
+  realtime_solver_max_iterations: 50
+
+# 无局部形变背景光场：离线标定和在线渲染共用
+lightfield:
+  device: gpu                  # 强制使用 JAX CUDA GPU
+  background:
+    # physical_residual：物理光场 + 残差 B/M；direct_fit：共享 RGB decoder；
+    # direct_fit_3：共享几何 encoder，R/G/B 各自独立拟合 B 并使用标量 decoder；
+    # geometry_cache：鲁棒几何锚点背景缓存与最近邻凸插值，不使用神经网络。
+    method: direct_fit_3
+    model_files:
+      physical_residual: assets/lightfield_model.yaml
+      direct_fit: assets/lightfield_direct_fit_model.yaml
+      direct_fit_3: assets/lightfield_direct_fit_3_model.yaml
+      geometry_cache: assets/lightfield_geometry_cache_model.yaml
+  direct_fit:
+    # direct_fit_3 默认复用本段超参数；如需单独调参，可增加同结构的 direct_fit_3 段。
+    # 饱和像素按相机实际输出参与背景学习；这里只腐蚀几何投影外边界，内部蓝色
+    # 饱和区域不会被删除，也不会因腐蚀而扩大。
+    sample_filter:
+      # 兼容旧模型配置保留；规范采样不再依据颜色阈值删像素。
+      saturation_threshold: 255
+      erode_pixels: 4
+    # 全局弯曲状态与逐点局部几何共同条件化；静态 B 逐通道保存固定纹理。
+    # direct_fit 解码 RGB delta B；direct_fit_3 的三个 decoder 各解码一个通道。
+    neural_field:
+      frequencies: [1, 2, 4, 8, 16, 32, 64]
+      geometry_descriptor_rows: 32
+      geometry_encoder_width: 224
+      geometry_encoder_layers: 4
+      geometry_latent_dimensions: 128
+      # 标准化全局几何的确定性 PCA 直连，与学习型 latent 并行输入解码器。
+      geometry_pca_dimensions: 48
+      decoder_width: 224
+      decoder_layers: 6
+      steps: 10000
+      batch_size: 8192
+      frame_batch_size: 8
+      learning_rate: 0.0008
+      # 静态 B 逐像素用 GPU Huber 聚合，不施加任何空间平滑；神经网络只拟合 delta B。
+      base_huber_iterations: 5
+      # direct_fit_3 按三类监督的综合 batch RMSE 自适应调节通道 loss；
+      # 0.5 保持 RGB 权重均值为 1，并将单通道权重限制在理论 0.5–2.0。
+      adaptive_channel_weight_strength: 0.5
+      # 同一帧相邻规范像素的预测 RGB 差必须匹配实测 RGB 差，直接监督高频细节。
+      spatial_difference_weight: 1.0
+      spatial_difference_validation_weight: 1.0
+      spatial_difference_points_per_frame: 256
+      # 在几何近邻帧的相同规范坐标上，监督预测 RGB 差与真实 RGB 差。
+      geometry_difference_weight: 1.0
+      geometry_difference_neighbor_count: 24
+      geometry_difference_points_per_pair: 256
+      # checkpoint 同时考核绝对 RGB 与相邻几何状态的 RGB 差，避免选中只会输出
+      # 跨帧平均背景、却无法跟随弯曲变化的模型。
+      geometry_difference_validation_weight: 1.0
+      # 用固定验证子集选择模型；每次改善都覆盖 best ckpt，最终 YAML 也恢复该次参数。
+      validation_interval: 100
+      validation_frame_count: 64
+      validation_points_per_frame: 256
+      early_stopping_patience: 15
+      early_stopping_min_steps: 2500
+      early_stopping_min_delta: 0.00002
+    # 会话启动只拟合叠加在神经场上的低频样条修正，避免吸收弯曲或接触特征。
+    session_correction_max_deviation: 0.30
+  geometry_cache:
+    # 使用中心线 XYZ 与横向宽度的低频三次样条作为几何键。IRLS 会降低局部
+    # 接触形变对整体弯曲状态的影响，不使用旧 curvature feature。
+    descriptor:
+      curve_coefficients: 12
+      pca_dimensions: 16
+      huber_delta_mm: 0.5
+    anchors:
+      # farthest-point 从几何键空间选锚点；每个锚点用其邻域帧逐像素 Huber
+      # 聚合背景，再把相对静态底图的增量拟合到 residual_coefficient_grid。
+      count: 48
+      neighbor_count: 8
+      interpolation_neighbor_count: 4
+      interpolation_distance_power: 2.0
+      interpolation_distance_epsilon: 0.001
+      background_huber_delta: 0.04
+      background_huber_iterations: 5
+      fit_batch_size: 4
+    sample_filter:
+      # 兼容旧模型配置保留；规范采样不再依据颜色阈值删像素。
+      saturation_threshold: 255
+      erode_pixels: 4
+    # 启动时仍只拟合独立的低频会话修正，不修改几何背景锚点。
+    session_correction_max_deviation: 0.30
+  # 每个颜色可配置一条边或边列表；同色不同边是参数独立的实体灯带。
+  # 灯带参数顺序固定为 R 列表、G 列表、B 列表；不同颜色可以使用同一曲面边界。
+  light_source_layout:
+    R: [right]
+    G: [left]
+    B: [bottom, top]
+  integration_nodes: 48        # 每条线光源的弧长积分节点
+  distance_epsilon_mm: 0.05    # 仅用于避免极近距离数值奇异
+  # (A + ell^2 L)S=AD 的 GPU 共轭梯度求解精度和最大迭代数。
+  diffusion_cg_tolerance: 0.0001
+  diffusion_cg_max_iterations: 30
+  gpu_chunk_size: 65536
+  calibration:
+    # images 和 videos 至少配置一项，也可以同时使用。视频会按时间顺序逐帧读取，
+    # 每个入选帧独立执行 SAM2 分割、全局曲面重建和 UV-XYZ 映射。
+    # images: /home/liuchaoyi/recon/assets/cali_lightfield_pics/*.png
+    images: null
+    # 例如: /home/liuchaoyi/recon/assets/cali_lightfield_videos/*.mp4
+    videos: /home/liuchaoyi/recon/assets/cali_lightfield_videos/*.avi
+    # 1 表示每帧都用于标定；2 表示每隔一帧取一帧。数据量很大时可先用 2~4。
+    video_frame_step: 1
+    # 每个视频最多选取的帧数；null 表示直到视频结束。
+    video_max_frames_per_file: null
+    # 入选帧会无损保存，供几何拟合和后续残差拟合共同使用。
+    video_frame_output_dir: assets/lightfield_calibration/video_frames
+    generated_map_dir: assets/lightfield_calibration/maps
+    sample_output_dir: assets/lightfield_calibration
+    # true：复用已导出的视频帧 PNG 和观测 npz，跳过重复 SAM2/写盘。
+    reuse_existing: true
+    # 物理模型 Adam 的 GPU batch；全量样本保留在 CPU，每次只传这一批到 GPU。
+    # 显存仍不足可降到 4；显存充足再提高到 16/32。
+    physical_batch_size: 40
+    physical_seed: 0
+    # 输入图片/视频和抽帧方式保持不变；只在观测生成后留出同源验证样本。
+    # 视频沿完整时间轴均匀留出，确保训练集仍覆盖平直到大弯曲的全部状态；
+    # 独立图片使用固定 seed 确定性划分。
+    validation_fraction: 0.20
+    validation_seed: 0
+    # 兼容旧观测缓存元数据保留；当前标定不再按颜色饱和度删除样本。
+    saturation_threshold: 250
+    spline_coefficients: 6
+    # 以下初值/边界既可保留 3 项并按颜色广播到该色全部灯带，也可按上述展开顺序
+    # 显式写 S 项，为同颜色不同边提供不同初值。优化后的每条灯带参数始终独立。
+    # 每条灯带两个几何自由度，顺序为 [局部 x, 曲面法向]；局部 x 正向指向接触面内部。
+    delta_initial_mm: [[0.0, 2.0], [0.0, 2.0], [0.0, 2.0]]
+    delta_bounds_mm:
+      - [[-8.0, 8.0], [0.0, 8.0]]
+      - [[-8.0, 8.0], [0.0, 8.0]]
+      - [[-8.0, 8.0], [0.0, 8.0]]
+    # 每条实体灯带的曲面扩散占比和毫米扩散长度。
+    scatter_ratio_initial: [0.10, 0.10, 0.10]
+    scatter_ratio_bounds: [[0.0, 0.40], [0.0, 0.40], [0.0, 0.40]]
+    scatter_length_initial_mm: [3.0, 3.0, 3.0]
+    scatter_length_bounds_mm: [[1.0, 10.0], [1.0, 10.0], [1.0, 10.0]]
+    # 同色灯带先求和。矩阵行是光源颜色 R/G/B，列是相机 RGB；
+    # 标定时 softmax 保证非负且每行和为 1。
+    mixing_matrix_initial:
+      - [0.95, 0.025, 0.025]
+      - [0.025, 0.95, 0.025]
+      - [0.025, 0.025, 0.95]
+    # 每条灯带分配给另外两个相机通道的总能量上限；因此主对角线至少为 0.8。
+    mixing_max_offdiagonal_sum: 0.20
+    huber_delta: 0.03
+    lambda_beta: 0.001
+    lambda_delta: 0.001
+    lambda_scatter_ratio: 0.01
+    lambda_scatter_length: 0.0001
+    lambda_mixing_matrix: 0.05
+    # 冻结物理模型后，在高分辨率规范曲面上联合学习长期 B 和前 k 个平滑 M；
+    # k 由 residual_m_count 人工指定。全部标定图片逐张作为独立样本参与，不分组，
+    # 不划分验证集。M 只从能被各图 XYZ 中心线曲率解释的残差中提取。
+    residual_m_count: 20
+    # 先从 XYZ 曲率向量提取此前 k_g 个几何主分量，再逐像素回归残差。
+    # k_g 必须不小于 residual_m_count，且必须小于图片数。
+    residual_curvature_feature_count: 96
+    residual_curvature_curve_coefficients: 12
+    lambda_residual_curvature_smooth: 0.01
+    lambda_residual_curvature_regression: 0.01
+    # 离线 B/M 的 GPU 分块大小。sample_batch 控制 B 与 M 分数拟合的帧批量；
+    # pixel_chunk 控制逐位置 96x96 曲率正规方程的并行数量。
+    residual_gpu_sample_batch_size: 8
+    residual_gpu_pixel_chunk_size: 128
+    # 逐通道时间 MAD 只在均匀选取的这些规范曲面像素上估计，避免全量排序。
+    residual_gpu_scale_sample_pixels: 512
+    residual_erode_pixels: 6
+    residual_huber_delta: 0.04
+    # 顶部条带位于外圈；0.2 会令该区域 Bsession 数据项过弱，先提高到 0.5。
+    residual_outer_weight: 0.75
+    residual_outer_fraction: 0.05
+    # B 只作 Bsession 的离线先验；M 在离线学习后冻结并保留到实时差分修正。
+    residual_b_max_field_deviation: 0.5
+    residual_bsession_max_field_deviation: 0.55
+    residual_m_max_field_deviation: 0.15
+    residual_bsession_prior_strength: 0.0002
+    # 128x64 三次样条需要保留可重复的横向条带；弱化二阶正则，避免把顶部
+    # 背景带压平成低频渐变。
+    lambda_residual_smooth: 0.001
+    lambda_residual_magnitude: 0.0001
+    # 数据 Huber、B 样条二阶差分和 delta 先验三项均按各自元素取 mean。
+    learning_rate: 0.005
+    # Adam 参数更新次数；每个 epoch 内的 batch 会洗牌后依次训练，不丢最后一批。
+    steps: 1500
+  irls:
+    iterations: 4
+    sigma_rgb: [0.03, 0.03, 0.03]
+    # 在线 gain/bias 先验由启动10帧的拟合均值给出；这里只指定正则强度和变化幅度。
+    lambda_gain: 100
+    max_gain_deviation: 0.8
+    lambda_bias: 100
+    max_bias_deviation: 1
+  runtime:
+    # 离线/兼容 CPU 光栅化只填投影域内部不超过该面积的亚像素孔洞；实时 GPU
+    # 路径直接把孔洞标为无效，不进行逐帧 CPU inpaint 或文件读写。
+    max_hole_area: 4
+    # 普通窗口只控制显示。局部重建所选的 residual_method 即使不显示也会计算；
+    # 命令行 --no-display 会关闭全部窗口。
+    display:
+      camera_original: false
+      physical_render: false
+      physical_plus_residual: false
+      signed_difference: false
+      # 这张图直接复用局部重建的有符号净化色差：零为灰色，正负方向颜色相反。
+      oracle_uniform_difference: true
+    # JAX GPU 融合光栅化容量。当前 80x12 网格实测最大三角形包围盒为 48x15；
+    # 这里保留充足余量，超过容量会明确报错而不会静默裁剪。
+    gpu_raster_triangle_chunk: 256
+    gpu_raster_max_triangle_width: 24
+    gpu_raster_max_triangle_height: 12
+    # 有符号色差图为线性 RGB 的 camera-rendered-A_rgb,k[Bsession,M]；
+    # 正负通道都进入法向 LUT，零差值在显示中为中性灰。
+    difference_gain: 2.0
+    # 差分图向内腐蚀有效域，避免把约 rms 大小的边缘投影错位当成底色误差。
+    difference_erode_pixels: 6
+
+    ### 启动标定设置 ###
+
+    # Bsession/M 的控制网格和运行时纹理网格统一在 get_surface.reconstruction
+    # 中配置；规范拟合样本分辨率自动使用 observation_grid。
+    # uniform_huber 的逐通道线性 RGB Huber 阈值和 IRLS 轮数；Bsession 启动
+    # 拟合也复用该阈值。选择纯 uniform 时逐帧背景系数不使用这两个参数。
+    residual_score_huber_delta: 0.04
+    residual_score_huber_iterations: 5
+    # 物理路径的系数拟合使用规则像素子集；direct 路径不使用该项。
+    residual_fit_pixel_stride: 4
+    # 物理路径先标定 gain/bias 再拟合 Bsession 并正交化 raw M；direct 路径对
+    # 每帧鲁棒拟合 gain/bias，再拟合叠加在几何条件神经场上的低频会话修正。
+    startup_gain_bias_frames: 15
+    startup_residual_frames: 15
+    # 离线 M 学习和启动10帧分别以各自的逐通道时间 MAD 缩放 Huber 阈值。
+    residual_channel_huber_ratio_min: 0.5
+    residual_channel_huber_ratio_max: 2.0
+    # 命令行实时打印三级 residual RMSE 和 uniform 系数矩阵的间隔。
+    residual_diagnostic_interval_seconds: 2.0
+
+    ### 启动稳定性判据 ###
+
+    # 正式标定前，最近连续 N 帧必须构成稳定窗口；判据帧不会进入标定数据。
+    startup_stability_required_frames: 5
+    # 窗口内每帧规范曲面残差相对窗口均值的最大 RGB RMS（线性 RGB）。
+    startup_stability_residual_field_rmse_threshold: 0.015
+    # 窗口内逐通道 gain/bias 的最大值减最小值上限。
+    startup_stability_gain_range_threshold: 0.01
+    startup_stability_bias_range_threshold: 0.01
+    # 所有窗口帧共同有效像素数 / 单帧最小有效像素数的下限。
+    startup_stability_minimum_valid_overlap: 0.90

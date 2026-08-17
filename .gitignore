@@ -1,0 +1,14 @@
+.venv/
+uv
+uv.tar.gz
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.vscode/
+
+# 本地采集/标定数据（体积过大，不上传 GitHub）
+assets/
+
+# 运行时生成的标定输出
+camera_calibration.yaml

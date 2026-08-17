@@ -1,0 +1,42 @@
+[project]
+name = "recon"
+version = "0.1.0"
+description = "SAM2-assisted camera edge segmentation and 3D surface reconstruction"
+requires-python = ">=3.10"
+dependencies = [
+    "jax[cuda12]>=0.4.30",
+    "open3d>=0.18.0",
+    "opencv-python>=4.8.0",
+    "pillow>=12.3.0",
+    "pyyaml>=6.0.3",
+    "scipy>=1.15.0",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "transformers>=5.14.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["utils"]
+py-modules = [
+    "capture",
+    "calibrate_camera",
+    "get_surface",
+    "calibrate_lightfield",
+    "calibrate_norm",
+    "manual_norm_regions",
+    "recon",
+    "render_lightfield",
+]
+
+[project.scripts]
+capture = "capture:main"
+calibrate-camera = "calibrate_camera:main"
+get-surface = "get_surface:main"
+calibrate-lightfield = "calibrate_lightfield:main"
+calibrate-norm = "calibrate_norm:main"
+recon-local = "recon:local_main"
+render-lightfield = "render_lightfield:main"
