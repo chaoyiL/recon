@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 from numbers import Real
 from threading import Lock
-from typing import Mapping, Sequence, TypeAlias
+from typing import Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -14,21 +13,10 @@ import torch
 from PIL import Image
 from transformers import Sam2VideoModel, Sam2VideoProcessor
 
-Point: TypeAlias = tuple[float, float]
-PromptGroup: TypeAlias = Mapping[str, Sequence[Point]]
-Prompts: TypeAlias = Mapping[str | int, PromptGroup]
+from utils.surface_mask import (
+    MaskRefineConfig,Point,PromptGroup,Prompts,refine_mask)
+
 DEFAULT_MODEL_ID = "facebook/sam2.1-hiera-tiny"
-
-
-@dataclass(frozen=True)
-class MaskRefineConfig:
-    """二值 mask 后处理：填洞、去噪、平滑边缘。"""
-
-    enabled: bool = True
-    close_kernel: int = 9
-    open_kernel: int = 3
-    blur_kernel: int = 5
-    keep_largest: bool = True
 
 
 class SurfaceSegmenter:
@@ -304,50 +292,6 @@ class SurfaceSegmenter:
         prompts: Prompts,
     ) -> dict[str | int, np.ndarray]:
         return self.segment(frame, prompts)
-
-
-def refine_mask(mask: np.ndarray, config: MaskRefineConfig) -> np.ndarray:
-    """对 SAM 二值 mask 做形态学整理，填充空洞并平滑锯齿边缘。"""
-    if not config.enabled:
-        return np.asarray(mask, dtype=np.bool_)
-
-    binary = (np.asarray(mask) > 0).astype(np.uint8) * 255
-    if not np.any(binary):
-        return binary.astype(bool)
-
-    close_k = _odd_kernel(config.close_kernel)
-    if close_k > 1:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    open_k = _odd_kernel(config.open_kernel)
-    if open_k > 1:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-
-    # 只保留外轮廓并填充，可去掉内部空洞。
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return np.zeros_like(binary, dtype=bool)
-
-    if config.keep_largest:
-        contours = (max(contours, key=cv2.contourArea),)
-
-    filled = np.zeros_like(binary)
-    cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
-
-    blur_k = _odd_kernel(config.blur_kernel)
-    if blur_k > 1:
-        filled = cv2.GaussianBlur(filled, (blur_k, blur_k), 0)
-        _, filled = cv2.threshold(filled, 127, 255, cv2.THRESH_BINARY)
-
-    return filled.astype(bool)
-
-
-def _odd_kernel(size: int) -> int:
-    if size <= 0:
-        return 0
-    return size if size % 2 == 1 else size + 1
 
 
 def _validate_prompts(

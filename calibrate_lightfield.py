@@ -1,10 +1,12 @@
 """使用 JAX 自动微分离线标定一条或多条独立线光源。"""
 from __future__ import annotations
 import argparse
+from dataclasses import replace
 import gc
 import glob
 import hashlib
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 import cv2
@@ -15,28 +17,28 @@ import torch
 import yaml
 from get_surface import (parse_mask_refine, parse_prompts,
                          point_set_from_surface_grids,
-                         save_generated_uv_xyz_map,torch_tensor_to_jax)
-from utils.config import (parse_background_method,
-                          parse_direct_fit_config,
-                          parse_geometry_cache_config,
+                         save_generated_uv_xyz_map)
+from utils.config import (load_config,parse_background_method,
+                          parse_direct_fit_3_config,parse_direct_fit_s_config,
                           parse_reconstruction_config,
                           resolve_background_model_path)
+from utils.direct_fit_s import fit_direct_fit_s_gpu
 from utils.gpu_residual_fit import (
     fit_direct_geometry_conditioned_field_gpu,
-    fit_robust_static_background_gpu,
     fit_residual_correction_model_gpu)
 from utils.jax_reconstruction import (
+    MATERIAL_UPDATE_FAILURE_NAMES,
     SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
-    prepare_edge_curves_from_masks_jax,reconstruct_surface_from_masks_jax)
-from utils.lightfield import (LightFieldModel, LightSourceLayout,
+    prepare_edge_curves_from_masks_jax,
+    reconstruct_material_surface_with_diagnostics_from_masks_jax,
+    reference_material_surface_state_jax)
+from utils.lightfield import (DEFAULT_LIGHT_SOURCE_LAYOUT,LightFieldModel,
+                              LightSourceLayout,
                               bounded_mixing_matrix,
                               bgr_to_linear_rgb_jax,
                               build_canonical_residual_sample_jax, choose_device,
                               direct_background_field_chunked,
                               evaluate_rgb_bspline,
-                              fit_rgb_bspline_field_gpu,
-                              geometry_cache_descriptor_jax,
-                              geometry_cache_background_field_jax,
                               fit_uniform_huber_residual_correction_scores_jax,
                               fit_uniform_residual_correction_scores_jax,
                               irls_gain_bias, physical_background_batch, point_set_to_grid,
@@ -44,14 +46,214 @@ from utils.lightfield import (LightFieldModel, LightSourceLayout,
                               rasterize_attributes_jax,
                               sample_rgb, sample_unsaturated_mask)
 from utils.process import EdgeReconstructor, ReconstructionPointSet
-from utils.sam2_surface import SurfaceSegmenter
+from utils.material_surface import MATERIAL_COORDINATE_MODE
+from utils.surface_segmentation import (
+    SurfaceSegmentationBackend,refine_masks_numpy,
+    parse_surface_segmentation_config)
+
+# 保留模块级名称，便于既有调用方注入测试后端。
+SurfaceSegmenter=SurfaceSegmentationBackend
 
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
+VIDEO_FRAME_PATTERN=re.compile(
+    r"^(video_\d+_.+)_frame_(\d+)$")
 
 
-CALIBRATION_OBSERVATION_FORMAT_VERSION = 2
+CALIBRATION_OBSERVATION_FORMAT_VERSION = 5
+CALIBRATION_FAILURE_FORMAT_VERSION = 2
 CALIBRATION_RECONSTRUCTION_PIPELINE = SURFACE_RECONSTRUCTION_PIPELINE_VERSION
+_DEFAULT_MATERIAL_DIAGNOSTIC_DIR=object()
+_RECONSTRUCTION_FAILURE_SUFFIX=".reconstruction_failure.npz"
+
+
+def _material_sequence_identity(path: Path) -> tuple[str | None,int | None]:
+    match=VIDEO_FRAME_PATTERN.match(path.stem)
+    if match is None:
+        return None,None
+    return match.group(1),int(match.group(2))
+
+
+def _surface_range_polygon(uv: np.ndarray) -> np.ndarray | None:
+    """把 RxCx2 曲面的四周边界整理为 OpenCV 多边形。"""
+    values=np.asarray(uv,np.float32)
+    if values.ndim!=3 or values.shape[-1]!=2 \
+            or min(values.shape[:2])<2:
+        return None
+    boundary=np.concatenate([
+        values[:,0],values[-1,1:],values[-2::-1,-1],
+        values[0,-2:0:-1]],axis=0)
+    if not np.isfinite(boundary).all():
+        return None
+    return np.rint(boundary).astype(np.int32).reshape(-1,1,2)
+
+
+def _draw_material_initialization_failure(
+    frame: np.ndarray,
+    refined_masks: np.ndarray,
+    template_uv: np.ndarray,
+    observed_uv: np.ndarray,
+    *,
+    template_length_mm: float,
+    observed_length_mm: float,
+    observed_rms_px: float,
+    maximum_rms_px: float,
+    reconstruction_valid: bool,
+    title: str = "MATERIAL INITIALIZATION FAILED",
+    matching_confidence: float | None = None,
+    minimum_confidence: float | None = None,
+    failure_reasons: tuple[str,...] = (),
+) -> np.ndarray:
+    """绘制材料候选失败的模板/实测范围诊断图。"""
+    image=np.asarray(frame,np.uint8).copy()
+    masks=np.asarray(refined_masks,np.bool_)
+    if masks.ndim==3 and masks.shape[1:]==image.shape[:2]:
+        combined=np.any(masks,axis=0)
+        tint=image.copy()
+        tint[combined]=(180,180,0)
+        image=cv2.addWeighted(image,.78,tint,.22,0)
+        contours,_=cv2.findContours(
+            combined.astype(np.uint8),cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(image,contours,-1,(255,255,0),1,cv2.LINE_AA)
+
+    template_polygon=_surface_range_polygon(template_uv)
+    observed_polygon=_surface_range_polygon(observed_uv)
+    if template_polygon is not None:
+        cv2.polylines(
+            image,[template_polygon],True,(255,0,255),3,cv2.LINE_AA)
+    if observed_polygon is not None:
+        cv2.polylines(
+            image,[observed_polygon],True,(0,255,0),3,cv2.LINE_AA)
+
+    for uv,color in ((template_uv,(255,0,255)),(observed_uv,(0,255,0))):
+        values=np.asarray(uv,np.float32)
+        if values.ndim!=3 or values.shape[-1]!=2:
+            continue
+        center=np.mean(values,axis=1)
+        if np.isfinite(center).all():
+            line=np.rint(center).astype(np.int32).reshape(-1,1,2)
+            cv2.polylines(image,[line],False,color,1,cv2.LINE_AA)
+            cv2.circle(image,tuple(line[0,0]),5,color,-1,cv2.LINE_AA)
+            cv2.circle(image,tuple(line[-1,0]),5,color,-1,cv2.LINE_AA)
+
+    length_ratio=(
+        abs(observed_length_mm-template_length_mm)/template_length_mm
+        if np.isfinite(observed_length_mm) and template_length_mm>0
+        else np.inf)
+    rms_ok=np.isfinite(observed_rms_px) and observed_rms_px<=maximum_rms_px
+    lines=[
+        title,
+        f"MAGENTA template: {template_length_mm:.3f} mm; CYAN segmentation mask",
+        (f"GREEN reconstruction: {observed_length_mm:.3f} mm, "
+         f"normalized length difference={100*length_ratio:.2f}% (diagnostic only)"),
+        (f"checks: reconstruction={int(reconstruction_valid)} "
+         f"rms={int(rms_ok)}  "
+         f"RMS={observed_rms_px:.3f} / {maximum_rms_px:.3f} px"),
+    ]
+    if matching_confidence is not None and minimum_confidence is not None:
+        confidence_ok=(np.isfinite(matching_confidence)
+                       and matching_confidence>=minimum_confidence)
+        lines.append(
+            f"confidence={matching_confidence:.6f} / "
+            f"{minimum_confidence:.6f}, ok={int(confidence_ok)}")
+    if failure_reasons:
+        lines.append("failure: "+", ".join(failure_reasons))
+    panel_height=18+24*len(lines)
+    panel_height=min(panel_height,image.shape[0])
+    panel_top=image.shape[0]-panel_height
+    panel=image[panel_top:].copy()
+    panel[:]=(16,16,16)
+    image[panel_top:]=cv2.addWeighted(
+        image[panel_top:],.25,panel,.75,0)
+    for line_index,line in enumerate(lines):
+        cv2.putText(
+            image,line,(10,panel_top+24+24*line_index),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .55,(245,245,245),1,cv2.LINE_AA)
+    return image
+
+
+def _write_material_failure(
+    output: Path,frame: np.ndarray,refined_masks: np.ndarray,
+    template_uv: np.ndarray,observed_xyz: np.ndarray,observed_uv: np.ndarray,
+    *,template_length_mm: float,
+    observed_rms_px: float,maximum_rms_px: float,
+    reconstruction_valid: bool,title: str,
+    matching_confidence: float | None = None,
+    minimum_confidence: float | None = None,
+    failure_reasons: tuple[str,...] = (),
+) -> tuple[Path,float]:
+    curve=np.asarray(observed_xyz,np.float32)[:,0,1:3]
+    observed_length=float(np.sum(np.linalg.norm(
+        np.diff(curve,axis=0),axis=1)))
+    diagnostic=_draw_material_initialization_failure(
+        frame,refined_masks,template_uv,observed_uv,
+        template_length_mm=template_length_mm,
+        observed_length_mm=observed_length,
+        observed_rms_px=observed_rms_px,maximum_rms_px=maximum_rms_px,
+        reconstruction_valid=reconstruction_valid,title=title,
+        matching_confidence=matching_confidence,
+        minimum_confidence=minimum_confidence,
+        failure_reasons=failure_reasons)
+    output.parent.mkdir(parents=True,exist_ok=True)
+    if not cv2.imwrite(
+            str(output),diagnostic,[cv2.IMWRITE_JPEG_QUALITY,92]):
+        raise RuntimeError(f"无法保存材料失败诊断图: {output}")
+    return output,observed_length
+
+
+def _write_material_initialization_failure(
+    output: Path,frame: np.ndarray,refined_masks: np.ndarray,
+    template_uv: np.ndarray,observed_xyz: np.ndarray,observed_uv: np.ndarray,
+    *,template_length_mm: float,
+    observed_rms_px: float,maximum_rms_px: float,
+    reconstruction_valid: bool,failure_reasons: tuple[str,...] = (),
+) -> tuple[Path,float]:
+    return _write_material_failure(
+        output,frame,refined_masks,template_uv,observed_xyz,observed_uv,
+        template_length_mm=template_length_mm,
+        observed_rms_px=observed_rms_px,maximum_rms_px=maximum_rms_px,
+        reconstruction_valid=reconstruction_valid,
+        title="MATERIAL CALIBRATION REJECTED (INITIAL)",
+        failure_reasons=failure_reasons)
+
+
+def _write_material_update_failure(
+    output: Path,frame: np.ndarray,refined_masks: np.ndarray,
+    previous_uv: np.ndarray,observed_xyz: np.ndarray,observed_uv: np.ndarray,
+    *,template_length_mm: float,
+    observed_rms_px: float,maximum_rms_px: float,
+    reconstruction_valid: bool,matching_confidence: float,
+    minimum_confidence: float,failure_reasons: tuple[str,...],
+) -> tuple[Path,float]:
+    return _write_material_failure(
+        output,frame,refined_masks,previous_uv,observed_xyz,observed_uv,
+        template_length_mm=template_length_mm,
+        observed_rms_px=observed_rms_px,maximum_rms_px=maximum_rms_px,
+        reconstruction_valid=reconstruction_valid,
+        title="MATERIAL CALIBRATION REJECTED",
+        matching_confidence=matching_confidence,
+        minimum_confidence=minimum_confidence,
+        failure_reasons=failure_reasons)
+
+
+def _refine_calibration_masks(
+    mask_tensor: object,
+    mask_refine: object,
+) -> np.ndarray:
+    """使两种分割后端都使用完全相同的 mask 后处理。"""
+    return refine_masks_numpy(mask_tensor,mask_refine)
+
+
+def _bind_material_model(
+    model: LightFieldModel,
+    reconstruction: object,
+) -> LightFieldModel:
+    template=reconstruction.material_template
+    return replace(
+        model,reconstruction_pipeline=CALIBRATION_RECONSTRUCTION_PIPELINE,
+        material_template_sha256=template.sha256)
 
 
 def _expand_source_parameter(
@@ -86,22 +288,32 @@ def _normalise_prompt_signature(prompts: dict[object,object]) -> list[dict[str,o
 
 
 def _calibration_reconstruction_signature(
-    *,model_id: str,prompts: dict[object,object],mask_refine: object,
-    center_band_d: float,reconstruction: object,
+    *,segmentation: object,prompts: dict[object,object],mask_refine: object,
+    reconstruction: object,
+    raster_max_width: int,raster_max_height: int,
+    independent_material_sequence: bool = False,
 ) -> str:
     """覆盖所有会改变离线 XYZ/UV/depth 的输入和算法语义。"""
     payload={
         "pipeline":CALIBRATION_RECONSTRUCTION_PIPELINE,
-        "model_id":model_id,
+        "segmentation":{
+            "mode":segmentation.mode,
+            "description":segmentation.description,
+            "frame_interval":int(segmentation.frame_interval),
+            "liteseg_foreground_class":int(
+                segmentation.liteseg_foreground_class),
+            "liteseg_label":segmentation.liteseg_label,
+        },
+        "independent_material_sequence":bool(
+            independent_material_sequence),
         "prompts":_normalise_prompt_signature(prompts),
         "mask_refine":{
+            "pipeline":"largest_external_fill_v1",
             "enabled":bool(mask_refine.enabled),
-            "close_kernel":int(mask_refine.close_kernel),
-            "open_kernel":int(mask_refine.open_kernel),
-            "blur_kernel":int(mask_refine.blur_kernel),
-            "keep_largest":bool(mask_refine.keep_largest),
         },
-        "center_band_d":float(center_band_d),
+        "side_edge_extraction":"central_sides_without_endpoint_inference_v3",
+        "side_edge_exclusion_ratio":float(
+            reconstruction.side_edge_exclusion_ratio),
         "camera_matrix":np.asarray(reconstruction.K,np.float64).tolist(),
         "distortion":np.asarray(
             reconstruction.distortion_coefficients,np.float64).tolist(),
@@ -114,6 +326,20 @@ def _calibration_reconstruction_signature(
         "uv_boundary_huber_delta_px":float(
             reconstruction.uv_boundary_huber_delta_px),
         "curve_convexity":str(reconstruction.curve_convexity),
+        "material_template_sha256":reconstruction.material_template.sha256,
+        "material_coordinate_mode":MATERIAL_COORDINATE_MODE,
+        "material_match_confidence_scale_mm":float(
+            reconstruction.material_surface.match_confidence_scale_mm),
+        "material_rms_confidence_scale_px":float(
+            reconstruction.material_surface.rms_confidence_scale_px),
+        "material_confidence_floor":float(
+            reconstruction.material_surface.confidence_floor),
+        "material_calibration_maximum_rms_px":float(
+            reconstruction.material_surface.calibration_maximum_rms_px),
+        "material_calibration_minimum_confidence":float(
+            reconstruction.material_surface.calibration_minimum_confidence),
+        "material_raster_max_triangle_width":int(raster_max_width),
+        "material_raster_max_triangle_height":int(raster_max_height),
     }
     encoded=json.dumps(payload,sort_keys=True,separators=(",",":"),
                        ensure_ascii=False).encode("utf-8")
@@ -129,8 +355,22 @@ def _source_identity(path: Path) -> tuple[str,int,int]:
 def _observation_metadata(
     image_path: Path,signature: str,curve_convexity: str,
     rotation_vector: np.ndarray,tx: float,rms_values: np.ndarray,
+    *,material_template_sha256: str = "0"*64,
+    sequence_id: str | None = None,sequence_frame_index: int | None = None,
+    matching_confidence: float = 0.,
+    visible_fraction: float = 0.,
+    raw_observed_xyz: np.ndarray | None = None,
 ) -> dict[str,object]:
     source_path,source_size,source_mtime_ns=_source_identity(image_path)
+    raw_xyz=np.asarray(raw_observed_xyz,np.float32) \
+        if raw_observed_xyz is not None else np.empty((0,0,3),np.float32)
+    if raw_xyz.size and (raw_xyz.ndim!=3 or raw_xyz.shape[-1]!=3
+                         or not np.isfinite(raw_xyz).all()):
+        raise ValueError("raw_observed_xyz 必须是有限的 RxCx3")
+    raw_curve=raw_xyz[:,0] if raw_xyz.size else np.empty((0,3),np.float32)
+    observed_length=(float(np.sum(np.linalg.norm(
+        np.diff(raw_curve[:,1:3],axis=0),axis=1)))
+        if raw_curve.shape[0]>1 else np.nan)
     return {
         "observation_format_version":np.asarray(
             CALIBRATION_OBSERVATION_FORMAT_VERSION,np.int32),
@@ -142,6 +382,17 @@ def _observation_metadata(
             rotation_vector,np.float64).reshape(3),
         "reconstruction_tx":np.asarray(tx,np.float64),
         "reconstruction_rms_px":np.asarray(rms_values,np.float32).reshape(-1),
+        "material_coordinate_mode":np.asarray(MATERIAL_COORDINATE_MODE),
+        "material_template_sha256":np.asarray(material_template_sha256),
+        "material_sequence_id":np.asarray(sequence_id or ""),
+        "material_sequence_frame_index":np.asarray(
+            -1 if sequence_frame_index is None else sequence_frame_index,
+            np.int64),
+        "material_matching_confidence":np.asarray(
+            matching_confidence,np.float32),
+        "material_visible_fraction":np.asarray(visible_fraction,np.float32),
+        "raw_observed_xyz":raw_xyz,
+        "raw_observed_length_mm":np.asarray(observed_length,np.float32),
         "source_image_resolved":np.asarray(source_path),
         "source_image_size":np.asarray(source_size,np.int64),
         "source_image_mtime_ns":np.asarray(source_mtime_ns,np.int64),
@@ -162,6 +413,10 @@ def _cached_observation_pose(
                 "observation_format_version","reconstruction_pipeline",
                 "reconstruction_signature","curve_convexity",
                 "reconstruction_rotation_vector","reconstruction_tx",
+                "material_coordinate_mode","material_template_sha256",
+                "material_sequence_id","material_sequence_frame_index",
+                "material_matching_confidence","material_visible_fraction",
+                "raw_observed_xyz","raw_observed_length_mm",
                 "source_image_resolved","source_image_size",
                 "source_image_mtime_ns","saturation_threshold",
                 "original_saturation_filter_enabled",
@@ -193,12 +448,114 @@ def _cached_observation_pose(
                     or data["rgb"].shape!=(rows,columns,3) \
                     or data["valid_mask"].shape!=(rows,columns):
                 return None
+            raw_xyz=np.asarray(data["raw_observed_xyz"],np.float32)
+            if raw_xyz.shape!=(rows,columns,3) \
+                    or not np.isfinite(raw_xyz).all() \
+                    or not np.isfinite(float(data["raw_observed_length_mm"])):
+                return None
             rotation=np.asarray(
                 data["reconstruction_rotation_vector"],np.float64).reshape(3)
             tx=float(data["reconstruction_tx"])
             if not np.isfinite(rotation).all() or not np.isfinite(tx):
                 return None
             return rotation,tx
+    except (OSError,ValueError,KeyError):
+        return None
+
+
+def _reconstruction_failure_path(output_dir: Path,image_path: Path) -> Path:
+    return output_dir/f"{image_path.stem}{_RECONSTRUCTION_FAILURE_SUFFIX}"
+
+
+def _write_reconstruction_failure(
+    output: Path,image_path: Path,signature: str,curve_convexity: str,
+    *,stage: str,failure_reasons: tuple[str,...],
+    saturation_threshold: int,filter_original_saturation: bool,
+    sequence_id: str | None = None,sequence_frame_index: int | None = None,
+    tracking_committed: bool = False,observed_length_mm: float = np.nan,
+    reprojection_rms_px: float = np.nan,matching_confidence: float = np.nan,
+) -> Path:
+    """原子保存未进入标定集的帧，使失败结果也能参与完整缓存判定。"""
+    if not stage or not failure_reasons:
+        raise ValueError("重建失败记录必须包含阶段和至少一个失败原因")
+    source_path,source_size,source_mtime_ns=_source_identity(image_path)
+    fields={
+        "failure_format_version":np.asarray(
+            CALIBRATION_FAILURE_FORMAT_VERSION,np.int32),
+        "reconstruction_pipeline":np.asarray(
+            CALIBRATION_RECONSTRUCTION_PIPELINE),
+        "reconstruction_signature":np.asarray(signature),
+        "curve_convexity":np.asarray(curve_convexity),
+        "result":np.asarray("failure"),
+        "failure_stage":np.asarray(stage),
+        "failure_reasons":np.asarray(failure_reasons),
+        "tracking_committed":np.asarray(tracking_committed),
+        "material_sequence_id":np.asarray(sequence_id or ""),
+        "material_sequence_frame_index":np.asarray(
+            -1 if sequence_frame_index is None else sequence_frame_index,
+            np.int64),
+        "observed_length_mm":np.asarray(observed_length_mm,np.float32),
+        "reconstruction_rms_px":np.asarray(
+            reprojection_rms_px,np.float32),
+        "material_matching_confidence":np.asarray(
+            matching_confidence,np.float32),
+        "source_image_resolved":np.asarray(source_path),
+        "source_image_size":np.asarray(source_size,np.int64),
+        "source_image_mtime_ns":np.asarray(source_mtime_ns,np.int64),
+        "saturation_threshold":np.asarray(saturation_threshold,np.int32),
+        "original_saturation_filter_enabled":np.asarray(
+            filter_original_saturation),
+    }
+    output.parent.mkdir(parents=True,exist_ok=True)
+    temporary=output.with_name(output.name+".tmp")
+    try:
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream,**fields)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return output
+
+
+def _cached_reconstruction_failure(
+    failure_path: Path,image_path: Path,signature: str,curve_convexity: str,
+    saturation_threshold: int,filter_original_saturation: bool,
+) -> tuple[str,...] | None:
+    """校验失败缓存确实属于当前源帧、配置和重建实现。"""
+    try:
+        source_path,source_size,source_mtime_ns=_source_identity(image_path)
+        with np.load(failure_path,allow_pickle=False) as data:
+            required={
+                "failure_format_version","reconstruction_pipeline",
+                "reconstruction_signature","curve_convexity","result",
+                "failure_stage","failure_reasons","source_image_resolved",
+                "source_image_size","source_image_mtime_ns",
+                "saturation_threshold","original_saturation_filter_enabled",
+            }
+            if not required.issubset(data.files):
+                return None
+            if int(data["failure_format_version"]) \
+                    !=CALIBRATION_FAILURE_FORMAT_VERSION \
+                    or str(data["reconstruction_pipeline"]) \
+                    !=CALIBRATION_RECONSTRUCTION_PIPELINE \
+                    or str(data["reconstruction_signature"])!=signature \
+                    or str(data["curve_convexity"])!=curve_convexity \
+                    or str(data["result"])!="failure":
+                return None
+            if str(data["source_image_resolved"])!=source_path \
+                    or int(data["source_image_size"])!=source_size \
+                    or int(data["source_image_mtime_ns"])!=source_mtime_ns:
+                return None
+            if int(data["saturation_threshold"])!=saturation_threshold \
+                    or bool(data["original_saturation_filter_enabled"]) \
+                    !=filter_original_saturation:
+                return None
+            if not str(data["failure_stage"]):
+                return None
+            reasons=tuple(
+                str(value) for value in np.asarray(
+                    data["failure_reasons"]).reshape(-1))
+            return reasons if reasons and all(reasons) else None
     except (OSError,ValueError,KeyError):
         return None
 
@@ -336,6 +693,7 @@ def extract_video_frames(
     frame_step: int = 1,
     max_frames_per_file: int | None = None,
     reuse_existing: bool = True,
+    group_prefix: str = "video",
 ) -> list[Path]:
     """顺序解码视频，将参与标定的帧无损保存，供标定的两个阶段复用。"""
     if not isinstance(frame_step,int) or isinstance(frame_step,bool) or frame_step<1:
@@ -349,12 +707,18 @@ def extract_video_frames(
 
     if not video_paths:
         return []
+    if not isinstance(group_prefix,str) or not group_prefix.strip() \
+            or any(character not in
+                   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+                   for character in group_prefix):
+        raise ValueError("视频抽帧 group_prefix 必须是非空字母数字下划线字符串")
     output_dir.mkdir(parents=True,exist_ok=True)
     extracted_paths: list[Path] = []
     for video_number,video_path in enumerate(video_paths,1):
         if video_path.suffix.lower() not in VIDEO_SUFFIXES:
             raise ValueError(f"不支持的视频扩展名: {video_path}")
-        prefix=f"video_{video_number:03d}_{video_path.stem}_frame_"
+        prefix=(f"{group_prefix}_{video_number:03d}_"
+                f"{video_path.stem}_frame_")
         if reuse_existing:
             existing=sorted(output_dir.glob(f"{prefix}*.png"))
             if existing:
@@ -412,6 +776,7 @@ def save_calibration_observation(image_path: Path, frame: np.ndarray,
                                  output_dir: Path, map_dir: Path,
                                  saturation_threshold: int = 250,
                                  *,filter_original_saturation: bool = False,
+                                 vertex_valid_mask: np.ndarray | None = None,
                                  reconstruction_metadata: dict[str,object] | None = None,
                                  ) -> Path:
     """严格使用当前图像内部重建出的 point_set，保存映射并生成标定观测。"""
@@ -427,6 +792,11 @@ def save_calibration_observation(image_path: Path, frame: np.ndarray,
         height,width=frame.shape[:2]
         valid_mask=((uv[...,0]>=0)&(uv[...,0]<width-1)&
                     (uv[...,1]>=0)&(uv[...,1]<height-1))
+    if vertex_valid_mask is not None:
+        material_valid=np.asarray(vertex_valid_mask,np.bool_)
+        if material_valid.shape!=valid_mask.shape:
+            raise ValueError("材料可见掩膜尺寸与标定观测网格不一致")
+        valid_mask&=material_valid
     valid_count=int(valid_mask.sum()); total_count=valid_mask.size
     if valid_count==0: raise RuntimeError(f"{image_path.name} 没有有效空间点")
     output_dir.mkdir(parents=True,exist_ok=True)
@@ -447,7 +817,13 @@ def save_calibration_observation(image_path: Path, frame: np.ndarray,
             raise ValueError(
                 f"标定观测元数据不能覆盖数据字段: {sorted(overlap)}")
         fields.update(reconstruction_metadata)
-    np.savez_compressed(output,**fields)
+    temporary=output.with_name(output.name+".tmp")
+    try:
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream,**fields)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
     filter_description=(f"original threshold<{saturation_threshold}"
                         if filter_original_saturation else "image bounds only")
     print(f"观测 {image_path.name}: 有效 {valid_count}/{total_count} "
@@ -458,27 +834,55 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
                                  config_path: Path, output_dir: Path,
                                  map_dir: Path,saturation_threshold: int = 250,
                                  *,filter_original_saturation: bool = False,
-                                 reuse_existing: bool = True) -> list[Path]:
-    """对每个图片或视频帧执行 SAM2 分割、全局重建、映射和 RGB 采样。"""
+                                 reuse_existing: bool = True,
+                                 material_initialization_diagnostic_dir: object =
+                                 _DEFAULT_MATERIAL_DIAGNOSTIC_DIR,
+                                 material_update_failure_diagnostic_dir: object =
+                                 _DEFAULT_MATERIAL_DIAGNOSTIC_DIR,
+                                 independent_material_sequence_id: str | None =
+                                 None,
+                                 ) -> list[Path]:
+    """对每个图片或视频帧执行配置的分割、全局重建、映射和 RGB 采样。"""
+    if independent_material_sequence_id is not None and (
+            not isinstance(independent_material_sequence_id,str)
+            or not independent_material_sequence_id.strip()):
+        raise ValueError(
+            "independent_material_sequence_id 必须是非空字符串或 null")
     output_dir.mkdir(parents=True,exist_ok=True)
     map_dir.mkdir(parents=True,exist_ok=True)
     surface=all_config["get_surface"]
     prompts=parse_prompts(surface["prompts"])
     mask_refine=parse_mask_refine(surface.get("mask_refine"))
-    center_band_d=float(surface.get("center_band_d",40))
+    segmentation=parse_surface_segmentation_config(
+        surface,config_path=config_path)
     calibration_output=all_config.get("calibration",{}).get("output")
     reconstruction=parse_reconstruction_config(
         surface.get("reconstruction"),config_path=config_path,
         calibration_output=calibration_output)
+    material_template=reconstruction.material_template
+    runtime=all_config.get("lightfield",{}).get("runtime",{})
+    if not isinstance(runtime,dict):
+        raise ValueError("lightfield.runtime 必须是字典")
+    raster_width_value=runtime.get("gpu_raster_max_triangle_width",64)
+    raster_height_value=runtime.get("gpu_raster_max_triangle_height",32)
+    if any(not isinstance(value,int) or isinstance(value,bool) or value<1
+           for value in (raster_width_value,raster_height_value)):
+        raise ValueError("runtime gpu_raster_max_triangle_* 参数必须为正整数")
+    # 离线规范采样已经以 64x32 为显式安全下限，候选提交门控与它完全一致。
+    raster_max_width=max(raster_width_value,64)
+    raster_max_height=max(raster_height_value,32)
     signature=_calibration_reconstruction_signature(
-        model_id=surface["model"],prompts=prompts,mask_refine=mask_refine,
-        center_band_d=center_band_d,reconstruction=reconstruction)
+        segmentation=segmentation,prompts=prompts,mask_refine=mask_refine,
+        reconstruction=reconstruction,raster_max_width=raster_max_width,
+        raster_max_height=raster_max_height,
+        independent_material_sequence=
+            independent_material_sequence_id is not None)
     expected_shape=(reconstruction.geometry_rows,
                     reconstruction.geometry_columns)
     pending: list[tuple[int,Path]]=[]
     outputs: list[Path | None]=[None]*len(image_paths)
     reused_poses: list[tuple[np.ndarray,float]]=[]
-    reused=0
+    reused=0; reused_failures=0
     for index,image_path in enumerate(image_paths):
         observation_path=output_dir/f"{image_path.stem}.npz"
         if reuse_existing and observation_path.exists():
@@ -491,6 +895,14 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
                 reused_poses.append(pose)
                 reused+=1
                 continue
+        failure_path=_reconstruction_failure_path(output_dir,image_path)
+        if reuse_existing and failure_path.exists() \
+                and _cached_reconstruction_failure(
+                    failure_path,image_path,signature,
+                    reconstruction.curve_convexity,saturation_threshold,
+                    filter_original_saturation) is not None:
+            reused_failures+=1
+            continue
         pending.append((index,image_path))
     if reused_poses:
         first_rotation,first_tx=reused_poses[0]
@@ -504,16 +916,35 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
             pending=list(enumerate(image_paths))
             reused_poses=[]
             reused=0
-    if reused:
-        print(f"复用已有观测 {reused}/{len(image_paths)}，待重建 {len(pending)}")
-    elif reuse_existing and any(
-            (output_dir/f"{path.stem}.npz").exists() for path in image_paths):
-        print("已有观测不含当前实时 JAX/凸性重建指纹；旧缓存将自动重建")
+            reused_failures=0
     if not pending:
-        return [path for path in outputs if path is not None]
+        completed=[path for path in outputs if path is not None]
+        print(
+            f"完整重建账本命中 {len(image_paths)}/{len(image_paths)}："
+            f"成功 {len(completed)}，失败 {reused_failures}；跳过全部重建计算")
+        if not completed:
+            raise RuntimeError("缓存账本显示所有标定观测均未通过实时 JAX/凸性重建")
+        return completed
+    if reused or reused_failures:
+        print(
+            f"复用已有结果：成功 {reused}，失败 {reused_failures}，"
+            f"未记录 {len(pending)}/{len(image_paths)}")
+    elif reuse_existing and any(
+            (output_dir/f"{path.stem}.npz").exists()
+            or _reconstruction_failure_path(output_dir,path).exists()
+            for path in image_paths):
+        print("已有结果不含当前实时 JAX/凸性重建指纹；旧缓存将自动重建")
+    # 材料状态具有时序依赖；只要任一观测缺失，就从输入起点重放全部序列，
+    # 避免把缓存帧之后的状态接到错误前驱。
+    if len(pending)!=len(image_paths):
+        print("材料状态链存在待重建帧；为保证前驱一致性，全部观测重新生成")
+        outputs=[None]*len(image_paths)
+        pending=list(enumerate(image_paths))
+        reused_poses=[]
 
-    print(f"加载 SAM2 全局曲面分割模型: {surface['model']}")
-    segmenter=SurfaceSegmenter(model_id=surface["model"],mask_refine=mask_refine)
+    print(f"加载全局曲面分割模型: {segmentation.description}")
+    segmenter=SurfaceSegmenter(
+        segmentation,prompts=prompts,mask_refine=mask_refine)
     reconstructor=EdgeReconstructor(reconstruction.K,reconstruction.distortion_coefficients,
                                    reconstruction.s1,reconstruction.s2,
                                    sample_count=reconstruction.sample_count)
@@ -528,38 +959,113 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
         reconstruction.distortion_coefficients,np.float32),device)
     inverse_camera_gpu=jax.device_put(np.asarray(
         np.linalg.inv(reconstruction.K),np.float32),device)
+    template_st_gpu=jax.device_put(material_template.st,device)
+    template_lengths_gpu=jax.device_put(
+        material_template.segment_lengths_mm,device)
+    template_x_gpu=jax.device_put(material_template.x_coordinates_mm,device)
+    template_curve_gpu=jax.device_put(
+        material_template.reference_curve_yz,device)
+    template_angles_gpu=jax.device_put(
+        material_template.reference_angles_rad,device)
+    material_cfg=reconstruction.material_surface
+    initialization_diagnostic_value=(
+        all_config.get("lightfield",{}).get("calibration",{}).get(
+            "material_initialization_diagnostic_dir",
+            output_dir/"material_initialization_failures")
+        if material_initialization_diagnostic_dir is
+            _DEFAULT_MATERIAL_DIAGNOSTIC_DIR
+        else material_initialization_diagnostic_dir)
+    update_diagnostic_value=(
+        all_config.get("lightfield",{}).get("calibration",{}).get(
+            "material_update_failure_diagnostic_dir",
+            output_dir/"material_update_failures")
+        if material_update_failure_diagnostic_dir is
+            _DEFAULT_MATERIAL_DIAGNOSTIC_DIR
+        else material_update_failure_diagnostic_dir)
 
-    def gpu_mask_kernel(size: int) -> int:
-        if not mask_refine.enabled or size<=0:
-            return 0
-        return size if size%2 else size+1
+    def resolve_diagnostic_dir(value: object,name: str) -> Path | None:
+        if value is None:
+            return None
+        if not isinstance(value,(str,Path)):
+            raise ValueError(f"{name} 必须是路径字符串或 null")
+        result=Path(value).expanduser()
+        if not result.is_absolute():
+            result=config_path.parent/result
+        result.mkdir(parents=True,exist_ok=True)
+        print(f"{name}: {result}")
+        return result
 
-    close_kernel=gpu_mask_kernel(mask_refine.close_kernel)
-    open_kernel=gpu_mask_kernel(mask_refine.open_kernel)
-    blur_kernel=gpu_mask_kernel(mask_refine.blur_kernel)
+    material_diagnostic_dir=resolve_diagnostic_dir(
+        initialization_diagnostic_value,"材料初始化失败诊断目录")
+    material_update_diagnostic_dir=resolve_diagnostic_dir(
+        update_diagnostic_value,"材料更新失败诊断目录")
+
+    # mask 已在 CPU 完成最大外轮廓保留和填洞，JAX 不再改变边界。
     prepare_curves_gpu=jax.jit(lambda masks:prepare_edge_curves_from_masks_jax(
         masks,camera_matrix_gpu,distortion_gpu,reconstructor.sample_count,
-        center_band_d,close_kernel=close_kernel,open_kernel=open_kernel,
-        blur_kernel=blur_kernel)[1:])
+        side_edge_exclusion_ratio=
+            reconstruction.side_edge_exclusion_ratio)[1:])
     reconstruct_geometry_gpu=jax.jit(
-        lambda masks,rotation,tx:reconstruct_surface_from_masks_jax(
+        lambda masks,rotation,tx,previous_state,initialized:
+        reconstruct_material_surface_with_diagnostics_from_masks_jax(
             masks,camera_matrix_gpu,distortion_gpu,inverse_camera_gpu,
             rotation,reconstruction.s1,reconstruction.s2,tx,
-            reconstructor.sample_count,center_band_d,
+            reconstructor.sample_count,
             reconstruction.pair_fill_count,
             reconstruction.uv_boundary_smooth_lambda,
             reconstruction.uv_boundary_huber_delta_px,
-            curve_convexity=reconstruction.curve_convexity,
-            close_kernel=close_kernel,open_kernel=open_kernel,
-            blur_kernel=blur_kernel))
+            previous_state,template_st_gpu,template_lengths_gpu,template_x_gpu,
+            initialized=initialized,
+            initial_calibration_maximum_rms_px=
+                material_cfg.initial_calibration_maximum_rms_px,
+            calibration_maximum_rms_px=
+                material_cfg.calibration_maximum_rms_px,
+            calibration_minimum_confidence=
+                material_cfg.calibration_minimum_confidence,
+            match_confidence_scale_mm=
+                material_cfg.match_confidence_scale_mm,
+            rms_confidence_scale_px=material_cfg.rms_confidence_scale_px,
+            confidence_floor=material_cfg.confidence_floor,
+            bend_direction=material_cfg.bend_direction,
+            maximum_uv_triangle_width_px=raster_max_width,
+            maximum_uv_triangle_height_px=raster_max_height,
+            side_edge_exclusion_ratio=
+                reconstruction.side_edge_exclusion_ratio))
+    material_state_gpu=None
+    material_sequence: str | None=None
+    material_initialized=False
     try:
         for done,(index,image_path) in enumerate(pending,1):
+            observation_path=output_dir/f"{image_path.stem}.npz"
+            failure_record_path=_reconstruction_failure_path(
+                output_dir,image_path)
+            # 失败目录反映本次重建结果，避免已恢复帧继续遗留旧失败图。
+            for diagnostic_dir,suffix in (
+                (material_diagnostic_dir,"material_init_failure.jpg"),
+                (material_update_diagnostic_dir,"material_update_failure.jpg"),
+            ):
+                if diagnostic_dir is None:
+                    continue
+                stale=diagnostic_dir/f"{image_path.stem}_{suffix}"
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError as error:
+                    print(f"警告：无法移除旧材料失败诊断图 {stale}: {error}")
             frame=cv2.imread(str(image_path),cv2.IMREAD_COLOR)
             if frame is None: raise RuntimeError(f"无法读取标定观测帧: {image_path}")
-            # 每帧是一项独立标定观测，禁止由上一帧的 mask memory 改变样本定义。
-            segmenter.reset()
-            labels,mask_tensor,_=segmenter.segment_tensors(frame,prompts)
-            mask_gpu=jax.device_put(torch_tensor_to_jax(mask_tensor),device)
+            source_sequence_id,sequence_frame_index=_material_sequence_identity(
+                image_path)
+            sequence_id=source_sequence_id
+            if sequence_id is None and independent_material_sequence_id \
+                    is not None:
+                sequence_id=independent_material_sequence_id
+                sequence_frame_index=index
+            reset_material_state=(
+                sequence_id is None or sequence_id!=material_sequence)
+            segmented=segmenter.segment_tensors(frame)
+            labels,mask_tensor=segmented[:2]
+            cleaned_masks=_refine_calibration_masks(mask_tensor,mask_refine)
+            mask_gpu=jax.device_put(cleaned_masks,device)
             if not reconstructor.calibrated:
                 left_curves,right_dense_curves,edge_valid=jax.device_get(
                     prepare_curves_gpu(mask_gpu))
@@ -572,23 +1078,144 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
                         continue
                     break
                 if not reconstructor.calibrated:
+                    observation_path.unlink(missing_ok=True)
+                    (map_dir/f"{image_path.stem}_uv_xyz.npz").unlink(
+                        missing_ok=True)
+                    _write_reconstruction_failure(
+                        failure_record_path,image_path,signature,
+                        reconstruction.curve_convexity,
+                        stage="fixed_pose_initialization",
+                        failure_reasons=("fixed_pose_initialization_failed",),
+                        saturation_threshold=saturation_threshold,
+                        filter_original_saturation=filter_original_saturation,
+                        sequence_id=sequence_id,
+                        sequence_frame_index=sequence_frame_index)
                     print(
                         f"跳过第 {index+1} 个观测帧：无法初始化固定外参 "
                         f"{image_path}")
                     continue
             rotation=cv2.Rodrigues(
                 reconstructor.rotation_vector)[0].astype(np.float32)
-            (refined_masks,xyz_grid,uv_grid,st_grid,depth_grid,rms_values,
-             reconstruction_valid)=jax.device_get(reconstruct_geometry_gpu(
-                 mask_gpu,jax.device_put(rotation,device),
-                 jax.device_put(np.asarray(reconstructor.tx,np.float32),device)))
-            del refined_masks
-            if not bool(np.all(reconstruction_valid)):
-                invalid=np.flatnonzero(~np.asarray(reconstruction_valid,np.bool_))
+            rotation_device=jax.device_put(rotation,device)
+            tx_device=jax.device_put(
+                np.asarray(reconstructor.tx,np.float32),device)
+            if reset_material_state or material_state_gpu is None:
+                material_state_gpu=reference_material_surface_state_jax(
+                    template_curve_gpu,template_angles_gpu,template_x_gpu,
+                    camera_matrix_gpu,distortion_gpu,rotation_device,tx_device)
+                material_initialized=False
+                material_sequence=sequence_id
+            was_material_initialized=material_initialized
+            material_result=reconstruct_geometry_gpu(
+                mask_gpu,rotation_device,tx_device,material_state_gpu,
+                jnp.asarray(was_material_initialized))
+            material_state_gpu=material_result[1]
+            (refined_masks,material_state_host,st_grid,reconstruction_valid,
+             tracking_accepted,calibration_accepted,observed_xyz,observed_uv,
+             observed_rms,failure_flags)=jax.device_get(material_result)
+            tracking_committed=bool(tracking_accepted)
+            if tracking_committed:
+                material_initialized=True
+            accepted=bool(calibration_accepted)
+            if not accepted:
+                failure_reasons=tuple(
+                    name for name,failed in zip(
+                        MATERIAL_UPDATE_FAILURE_NAMES,
+                        np.asarray(failure_flags,np.bool_).tolist(),strict=True)
+                    if failed)
+                if not failure_reasons:
+                    failure_reasons=("calibration_rejected",)
+                failed_rms=float(material_state_host.reprojection_rms_px)
+                failed_confidence=float(
+                    material_state_host.matching_confidence)
+                diagnostic_path=None
+                observed_curve=np.asarray(observed_xyz,np.float32)[:,0,1:3]
+                observed_length=float(np.sum(np.linalg.norm(
+                    np.diff(observed_curve,axis=0),axis=1)))
+                if not was_material_initialized \
+                        and material_diagnostic_dir is not None:
+                    diagnostic_path=(material_diagnostic_dir/
+                                     f"{image_path.stem}_material_init_failure.jpg")
+                    try:
+                        diagnostic_path,observed_length=(
+                            _write_material_initialization_failure(
+                                diagnostic_path,frame,refined_masks,
+                                np.asarray(material_state_host.uv),observed_xyz,
+                                observed_uv,
+                                template_length_mm=
+                                    material_template.total_length_mm,
+                                observed_rms_px=failed_rms,
+                                maximum_rms_px=(material_cfg.
+                                    initial_calibration_maximum_rms_px),
+                                reconstruction_valid=bool(
+                                    reconstruction_valid[0]),
+                                failure_reasons=failure_reasons))
+                    except (OSError,RuntimeError,ValueError) as error:
+                        diagnostic_path=None
+                        print(f"警告：材料初始化诊断图保存失败: {error}")
+                elif was_material_initialized \
+                        and material_update_diagnostic_dir is not None:
+                    diagnostic_path=(material_update_diagnostic_dir/
+                                     f"{image_path.stem}_material_update_failure.jpg")
+                    try:
+                        diagnostic_path,observed_length=(
+                            _write_material_update_failure(
+                                diagnostic_path,frame,refined_masks,
+                                np.asarray(material_state_host.uv),observed_xyz,
+                                observed_uv,
+                                template_length_mm=
+                                    material_template.total_length_mm,
+                                observed_rms_px=failed_rms,
+                                maximum_rms_px=
+                                    material_cfg.calibration_maximum_rms_px,
+                                reconstruction_valid=bool(
+                                    reconstruction_valid[0]),
+                                matching_confidence=failed_confidence,
+                                minimum_confidence=
+                                    material_cfg.calibration_minimum_confidence,
+                                failure_reasons=failure_reasons))
+                    except (OSError,RuntimeError,ValueError) as error:
+                        diagnostic_path=None
+                        print(f"警告：材料更新失败诊断图保存失败: {error}")
+                if not was_material_initialized and not tracking_committed:
+                    material_state_gpu=None
+                    material_sequence=None
+                observation_path.unlink(missing_ok=True)
+                (map_dir/f"{image_path.stem}_uv_xyz.npz").unlink(
+                    missing_ok=True)
+                _write_reconstruction_failure(
+                    failure_record_path,image_path,signature,
+                    reconstruction.curve_convexity,
+                    stage="material_calibration_admission",
+                    failure_reasons=failure_reasons,
+                    saturation_threshold=saturation_threshold,
+                    filter_original_saturation=filter_original_saturation,
+                    sequence_id=sequence_id,
+                    sequence_frame_index=sequence_frame_index,
+                    tracking_committed=tracking_committed,
+                    observed_length_mm=observed_length,
+                    reprojection_rms_px=failed_rms,
+                    matching_confidence=failed_confidence)
+                diagnostic_text=f"，diagnostic={diagnostic_path}" \
+                    if diagnostic_path is not None else ""
                 print(
-                    f"跳过第 {index+1} 个观测帧：实时 JAX/凸性重建无效，"
-                    f"surface={invalid.tolist()}，{image_path}")
+                    f"跳过第 {index+1} 个观测帧：未通过标定准入，"
+                    f"tracking={int(tracking_committed)}，"
+                    f"sequence={sequence_id!r}，reasons={failure_reasons}，"
+                    f"length={observed_length:.3f}/"
+                    f"{material_template.total_length_mm:.3f}mm，"
+                    f"RMS={failed_rms:.3f}px，"
+                    f"confidence={failed_confidence:.6f}，"
+                    f"{image_path}{diagnostic_text}")
                 continue
+            raw_observed_xyz=np.asarray(observed_xyz,np.float32)
+            del refined_masks,observed_xyz,observed_uv,observed_rms
+            xyz_grid=np.asarray(material_state_host.xyz)
+            uv_grid=np.asarray(material_state_host.uv)
+            depth_grid=np.asarray(material_state_host.camera_depth)
+            material_visible=np.asarray(material_state_host.visible,np.bool_)
+            rms_values=np.asarray(
+                [material_state_host.reprojection_rms_px],np.float32)
             point_set=point_set_from_surface_grids(
                 xyz_grid,uv_grid,st_grid,depth_grid,reconstruction.K,
                 reconstruction.distortion_coefficients,
@@ -596,10 +1223,21 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
                 surface_rows=reconstruction.geometry_rows)
             metadata=_observation_metadata(
                 image_path,signature,reconstruction.curve_convexity,
-                reconstructor.rotation_vector,reconstructor.tx,rms_values)
+                reconstructor.rotation_vector,reconstructor.tx,rms_values,
+                material_template_sha256=material_template.sha256,
+                sequence_id=sequence_id,
+                sequence_frame_index=sequence_frame_index,
+                matching_confidence=float(
+                    material_state_host.matching_confidence),
+                visible_fraction=float(
+                    material_state_host.visible_fraction),
+                raw_observed_xyz=raw_observed_xyz)
+            # 先移除相反结果；若随后写盘中断，下次会把本帧识别为未完成并重放。
+            failure_record_path.unlink(missing_ok=True)
             outputs[index]=save_calibration_observation(
                 image_path,frame,point_set,output_dir,map_dir,saturation_threshold,
                 filter_original_saturation=filter_original_saturation,
+                vertex_valid_mask=material_visible,
                 reconstruction_metadata=metadata)
             print(f"全局重建 {done}/{len(pending)} "
                   f"(总进度 {index+1}/{len(image_paths)}) 完成: {image_path.name}；"
@@ -621,7 +1259,7 @@ def reconstruct_all_observations(image_paths: list[Path], all_config: dict,
 def _collect_direct_canonical_fields(
     source_images: list[Path],uv_values: list[np.ndarray],
     depth_values: list[np.ndarray],*,sample_shape: tuple[int,int],
-    saturation_threshold: int,erode_pixels: int,raster_triangle_chunk: int,
+    erode_pixels: int,raster_triangle_chunk: int,
     raster_max_width: int,raster_max_height: int,device: jax.Device,
 ) -> tuple[np.ndarray,np.ndarray]:
     """按现有 UV/有效域把绝对线性 RGB 采样到规范 observation_grid。"""
@@ -641,7 +1279,7 @@ def _collect_direct_canonical_fields(
         field=bgr_to_linear_rgb_jax(frame_bgr)
         canonical,canonical_valid=build_canonical_residual_sample_jax(
             field,frame_bgr,valid,uv,sample_shape,
-            saturation_threshold=saturation_threshold,
+            saturation_threshold=255,
             erode_pixels=erode_pixels)
         return canonical,canonical_valid,overflow
 
@@ -682,165 +1320,7 @@ def _valid_rmse(values: np.ndarray,valid: np.ndarray) -> np.ndarray:
         axis=tuple(range(values.ndim-1)))/count)
 
 
-def _farthest_geometry_anchor_indices(
-    keys: np.ndarray,count: int,
-) -> np.ndarray:
-    """确定性 farthest-point 采样，覆盖几何键空间而不依赖采集顺序。"""
-    values=np.asarray(keys,np.float64)
-    if values.ndim!=2 or not 1<=count<=values.shape[0] \
-            or not np.isfinite(values).all():
-        raise ValueError("geometry cache anchor 输入无效")
-    center=values.mean(axis=0)
-    first=int(np.argmax(np.sum((values-center)**2,axis=1)))
-    selected=[first]
-    minimum_distance=np.sum((values-values[first])**2,axis=1)
-    minimum_distance[first]=-np.inf
-    while len(selected)<count:
-        current=int(np.argmax(minimum_distance))
-        selected.append(current)
-        minimum_distance=np.minimum(
-            minimum_distance,np.sum((values-values[current])**2,axis=1))
-        minimum_distance[np.asarray(selected,np.int64)]=-np.inf
-    return np.asarray(selected,np.int64)
-
-
-def _calibrate_geometry_cache(
-    *,raw: dict,cfg: dict,reconstruction: object,device: jax.Device,
-    source_layout: LightSourceLayout,source_images: list[Path],
-    uv_parts: list[np.ndarray],depth_parts: list[np.ndarray],xyz_all: np.ndarray,
-    training_indices: np.ndarray,validation_indices: np.ndarray,
-    model_output: Path,
-) -> None:
-    """标定独立的鲁棒几何锚点背景缓存与最近邻凸插值。"""
-    cache=parse_geometry_cache_config(raw)
-    runtime=raw.get("runtime",{})
-    sample_shape=(reconstruction.observation_rows,
-                  reconstruction.observation_columns)
-    canonical,canonical_valid=_collect_direct_canonical_fields(
-        source_images,uv_parts,depth_parts,sample_shape=sample_shape,
-        saturation_threshold=cache.sample_saturation_threshold,
-        erode_pixels=cache.sample_erode_pixels,
-        raster_triangle_chunk=int(
-            runtime.get("gpu_raster_triangle_chunk",256)),
-        raster_max_width=max(int(
-            runtime.get("gpu_raster_max_triangle_width",24)),64),
-        raster_max_height=max(int(
-            runtime.get("gpu_raster_max_triangle_height",12)),32),
-        device=device)
-    training_count=training_indices.size
-    if training_count<3:
-        raise ValueError("geometry_cache 至少需要 3 个训练样本")
-    if cache.anchor_count>training_count:
-        raise ValueError(
-            "geometry_cache anchor count 不能大于训练样本数")
-    if cache.anchor_neighbor_count>training_count:
-        raise ValueError(
-            "geometry_cache anchor neighbor_count 不能大于训练样本数")
-    if cache.descriptor_curve_coefficients>xyz_all.shape[1]:
-        raise ValueError(
-            "geometry_cache curve_coefficients 不能大于几何网格行数")
-
-    descriptor_one=jax.jit(lambda xyz:geometry_cache_descriptor_jax(
-        xyz,cache.descriptor_curve_coefficients,
-        cache.descriptor_huber_delta_mm))
-    descriptor_parts=[]
-    for start in range(0,training_count,cache.fit_batch_size):
-        indices=training_indices[start:start+cache.fit_batch_size]
-        descriptor_parts.append(np.stack([
-            np.asarray(descriptor_one(jax.device_put(xyz_all[index],device)))
-            for index in indices]))
-    descriptors=np.concatenate(descriptor_parts,axis=0).astype(np.float64)
-    descriptor_mean=descriptors.mean(axis=0)
-    descriptor_scale=np.maximum(descriptors.std(axis=0),1e-6)
-    normalized=(descriptors-descriptor_mean)/descriptor_scale
-    _,singular,components_t=np.linalg.svd(normalized,full_matrices=False)
-    tolerance=max(normalized.shape)*np.finfo(np.float64).eps*max(
-        float(singular[0]) if singular.size else 0.,1.)
-    rank=int(np.count_nonzero(singular>tolerance))
-    pca_dimensions=min(
-        cache.descriptor_pca_dimensions,rank,training_count-1)
-    if pca_dimensions<1:
-        raise ValueError("geometry_cache 几何描述没有有效变化维度")
-    pca_components=components_t[:pca_dimensions].T
-    unscaled_keys=normalized@pca_components
-    pca_scale=np.maximum(unscaled_keys.std(axis=0),1e-6)
-    keys=unscaled_keys/pca_scale
-    anchor_indices=_farthest_geometry_anchor_indices(
-        keys,cache.anchor_count)
-    anchor_keys=keys[anchor_indices]
-
-    train_fields=canonical[training_indices]
-    train_valid=canonical_valid[training_indices]
-    base_texture=fit_robust_static_background_gpu(
-        train_fields,train_valid,device=device,
-        huber_delta=cache.background_huber_delta,
-        iterations=cache.background_huber_iterations,
-        frame_batch_size=cache.fit_batch_size,shared_rgb_weights=True)
-    residual_rows=reconstruction.residual_coefficient_rows
-    residual_columns=reconstruction.residual_coefficient_columns
-    anchor_coefficients=[]
-    print("geometry_cache 锚点拟合："
-          f"anchors={cache.anchor_count}，neighbors="
-          f"{cache.anchor_neighbor_count}，PCA={pca_dimensions}，"
-          f"B-spline={residual_rows}x{residual_columns}")
-    for position,anchor_index in enumerate(anchor_indices,1):
-        distance=np.sum((keys-keys[anchor_index])**2,axis=1)
-        neighbors=np.argsort(distance)[:cache.anchor_neighbor_count]
-        local_texture=fit_robust_static_background_gpu(
-            train_fields[neighbors],train_valid[neighbors],device=device,
-            huber_delta=cache.background_huber_delta,
-            iterations=cache.background_huber_iterations,
-            frame_batch_size=cache.fit_batch_size,shared_rgb_weights=True)
-        coverage=np.any(train_valid[neighbors],axis=0).astype(np.float32)
-        coefficients=fit_rgb_bspline_field_gpu(
-            local_texture-base_texture,coverage,residual_rows,residual_columns,
-            float(cfg.get("lambda_residual_smooth",.001)),
-            float(cfg.get("lambda_residual_magnitude",1e-4)),device=device)
-        anchor_coefficients.append(coefficients)
-        if position==1 or position%8==0 or position==cache.anchor_count:
-            print(f"geometry_cache anchor {position}/{cache.anchor_count}")
-    anchor_coefficients=np.stack(anchor_coefficients).astype(np.float32)
-    session_correction=np.zeros(
-        (3,residual_rows,residual_columns),np.float32)
-    model=LightFieldModel.geometry_cache(
-        session_correction,base_texture=base_texture,
-        anchor_coefficients=anchor_coefficients,
-        descriptor_mean=descriptor_mean.astype(np.float32),
-        descriptor_scale=descriptor_scale.astype(np.float32),
-        pca_components=pca_components.astype(np.float32),
-        pca_scale=pca_scale.astype(np.float32),
-        anchor_keys=anchor_keys.astype(np.float32),
-        curve_coefficients=cache.descriptor_curve_coefficients,
-        descriptor_huber_delta=cache.descriptor_huber_delta_mm,
-        interpolation_neighbors=cache.interpolation_neighbor_count,
-        distance_power=cache.interpolation_distance_power,
-        distance_epsilon=cache.interpolation_distance_epsilon,
-        curve_convexity=reconstruction.curve_convexity,
-        reconstruction_pipeline=CALIBRATION_RECONSTRUCTION_PIPELINE,
-        source_layout=source_layout)
-    model_gpu=jax.device_put(model,device)
-    evaluate=jax.jit(lambda xyz:geometry_cache_background_field_jax(
-        sample_shape,xyz,model_gpu))
-
-    def predictions(indices: np.ndarray) -> np.ndarray:
-        return np.stack([np.asarray(evaluate(
-            jax.device_put(xyz_all[index],device))) for index in indices])
-
-    training_rmse=_valid_rmse(
-        canonical[training_indices]-predictions(training_indices),
-        canonical_valid[training_indices])
-    validation_rmse=np.full(3,np.nan,np.float64)
-    if validation_indices.size:
-        validation_rmse=_valid_rmse(
-            canonical[validation_indices]-predictions(validation_indices),
-            canonical_valid[validation_indices])
-    model.save(model_output)
-    print("geometry_cache 已保存：train/validation RMSE RGB="
-          f"{training_rmse.tolist()}/{validation_rmse.tolist()}，"
-          f"model={model_output}")
-
-
-def _calibrate_direct_fit(
+def _calibrate_direct_fit_3(
     *,raw: dict,cfg: dict,reconstruction: object,device: jax.Device,
     background_method: str,
     source_layout: LightSourceLayout,source_images: list[Path],
@@ -848,11 +1328,11 @@ def _calibrate_direct_fit(
     training_indices: np.ndarray,validation_indices: np.ndarray,
     model_output: Path,
 ) -> None:
-    """训练 direct 几何条件神经场，并报告同源留出集误差。"""
-    if background_method not in {"direct_fit","direct_fit_3"}:
-        raise ValueError("direct 标定收到无效 background_method")
+    """训练 direct_fit_3 几何条件神经场，并报告同源留出集误差。"""
+    if background_method!="direct_fit_3":
+        raise ValueError("direct_fit_3 标定收到无效 background_method")
     runtime=raw.get("runtime",{})
-    direct=parse_direct_fit_config(raw)
+    direct=parse_direct_fit_3_config(raw)
     sample_shape=(reconstruction.observation_rows,
                   reconstruction.observation_columns)
     raster_triangle_chunk=int(runtime.get("gpu_raster_triangle_chunk",256))
@@ -862,13 +1342,12 @@ def _calibrate_direct_fit(
         int(runtime.get("gpu_raster_max_triangle_height",12)),32)
     canonical,canonical_valid=_collect_direct_canonical_fields(
         source_images,uv_parts,depth_parts,sample_shape=sample_shape,
-        saturation_threshold=direct.sample_saturation_threshold,
         erode_pixels=direct.sample_erode_pixels,
         raster_triangle_chunk=raster_triangle_chunk,
         raster_max_width=raster_max_width,raster_max_height=raster_max_height,
         device=device)
     if training_indices.size<3:
-        raise ValueError("direct_fit 统一神经场至少需要 3 个训练样本")
+        raise ValueError("direct_fit_3 统一神经场至少需要 3 个训练样本")
     checkpoint_path=model_output.with_suffix(".best_ckpt.npz")
     checkpoint_validation_indices=np.empty(0,np.int64)
     if validation_indices.size:
@@ -905,27 +1384,22 @@ def _calibrate_direct_fit(
         huber_delta=float(cfg.get("residual_huber_delta",.04)),
         base_huber_iterations=direct.base_huber_iterations,
         adaptive_channel_weight_strength=(
-            direct.adaptive_channel_weight_strength
-            if background_method=="direct_fit_3" else 0.),
+            direct.adaptive_channel_weight_strength),
         spatial_difference_weight=direct.spatial_difference_weight,
-        spatial_difference_validation_weight=(
-            direct.spatial_difference_validation_weight),
         spatial_difference_points_per_frame=(
             direct.spatial_difference_points_per_frame),
         geometry_difference_weight=direct.geometry_difference_weight,
-        geometry_difference_validation_weight=(
-            direct.geometry_difference_validation_weight),
         geometry_difference_neighbor_count=(
             direct.geometry_difference_neighbor_count),
         geometry_difference_points_per_pair=(
             direct.geometry_difference_points_per_pair),
-        seed=int(cfg.get("physical_seed",0)),
+        seed=int(cfg.get("training_seed",cfg.get("physical_seed",0))),
         validation_interval=direct.validation_interval,
         validation_points_per_frame=direct.validation_points_per_frame,
         early_stopping_patience=direct.early_stopping_patience,
         early_stopping_min_steps=direct.early_stopping_min_steps,
         early_stopping_min_delta=direct.early_stopping_min_delta,
-        separate_channel_decoders=(background_method=="direct_fit_3")))
+        separate_channel_decoders=True))
     # 释放 Adam/训练图占用的编译缓存与碎片显存，再展开 observation_grid 全场。
     jax.clear_caches()
     gc.collect()
@@ -949,16 +1423,18 @@ def _calibrate_direct_fit(
         "reconstruction_pipeline":CALIBRATION_RECONSTRUCTION_PIPELINE,
         "source_layout":source_layout,
     }
-    if background_method=="direct_fit_3":
-        model=LightFieldModel.direct_fit_3(
-            session_correction,
-            channel_decoder_weights=decoder_weights,
-            channel_decoder_biases=decoder_biases,
-            **common_model_arguments)
-    else:
-        model=LightFieldModel.direct_fit(
-            session_correction,decoder_weights=decoder_weights,
-            decoder_biases=decoder_biases,**common_model_arguments)
+    model=LightFieldModel.direct_fit_3(
+        session_correction,
+        channel_decoder_weights=decoder_weights,
+        channel_decoder_biases=decoder_biases,
+        **common_model_arguments)
+
+    # 最佳 checkpoint 已包含生成最终模型所需的全部参数。先绑定模板并原子
+    # 保存，再展开训练/验证集全场预测；后者耗时且显存占用高，不能让报告阶段
+    # 的中断留下“checkpoint 完整但最终 YAML 不存在”的半成品状态。
+    model=_bind_material_model(model,reconstruction)
+    model.save(model_output)
+    print(f"{background_method} 最佳参数模型已先行保存：{model_output}")
 
     # 与训练 batch_size 对齐：400x202 全场一次性 decode 会再申请 ~2GiB+ 激活。
     field_chunk_size=max(int(direct.batch_size),1)
@@ -991,7 +1467,6 @@ def _calibrate_direct_fit(
             canonical[validation_indices]-validation_prediction,
             canonical_valid[validation_indices])
 
-    model.save(model_output)
     print(f"{background_method} 已保存 B + delta B + Bsession 模型："
           f"B-only train/validation RMSE RGB="
           f"{training_base_rmse.tolist()}/{validation_base_rmse.tolist()}，"
@@ -1000,10 +1475,100 @@ def _calibrate_direct_fit(
     print(f"标定完成（background_method={background_method}，JAX device={device}）："
           f"{model_output}")
 
+
+def _contiguous_role_sequences(
+    indices: np.ndarray,sequence_ids: list[str],frame_indices: np.ndarray,
+    *,maximum_gap: int,
+) -> list[np.ndarray]:
+    """按视频和原始帧号排序，并在失败/缺失帧处切断 GRU 序列。"""
+    groups: dict[str,list[int]]={}
+    for index in np.asarray(indices,np.int64):
+        sequence_id=sequence_ids[int(index)]
+        if not sequence_id:
+            raise ValueError("direct_fit_s 只接受带视频序列元数据的观测")
+        groups.setdefault(sequence_id,[]).append(int(index))
+    result=[]
+    for values in groups.values():
+        values.sort(key=lambda value:int(frame_indices[value]))
+        current=[values[0]]
+        for value in values[1:]:
+            if int(frame_indices[value])-int(frame_indices[current[-1]]) \
+                    <=maximum_gap:
+                current.append(value)
+            else:
+                result.append(np.asarray(current,np.int64))
+                current=[value]
+        result.append(np.asarray(current,np.int64))
+    return result
+
+
+def _calibrate_direct_fit_s(
+    *,raw: dict,cfg: dict,reconstruction: object,device: jax.Device,
+    source_layout: LightSourceLayout,source_images: list[Path],
+    uv_parts: list[np.ndarray],depth_parts: list[np.ndarray],
+    xyz_all: np.ndarray,raw_xyz_all: np.ndarray,
+    trusted_indices: np.ndarray,trusted_sequences: list[np.ndarray],
+    sequence_sequences: list[np.ndarray],model_output: Path,
+) -> None:
+    """训练只沿 s 做隐式区间对齐的 direct_fit_s 序列背景场。"""
+    direct=parse_direct_fit_s_config(raw)
+    runtime=raw.get("runtime",{})
+    sample_shape=(reconstruction.observation_rows,
+                  reconstruction.observation_columns)
+    canonical,canonical_valid=_collect_direct_canonical_fields(
+        source_images,uv_parts,depth_parts,sample_shape=sample_shape,
+        erode_pixels=direct.sample_erode_pixels,
+        raster_triangle_chunk=int(runtime.get("gpu_raster_triangle_chunk",256)),
+        raster_max_width=max(
+            int(runtime.get("gpu_raster_max_triangle_width",24)),64),
+        raster_max_height=max(
+            int(runtime.get("gpu_raster_max_triangle_height",12)),32),
+        device=device)
+    result=fit_direct_fit_s_gpu(
+        canonical,canonical_valid,surface_xyz=xyz_all,
+        raw_observed_xyz=raw_xyz_all,trusted_indices=trusted_indices,
+        trusted_sequences=trusted_sequences,
+        sequence_sequences=sequence_sequences,device=device,config=direct,
+        huber_delta=float(cfg.get("residual_huber_delta",.04)),
+        seed=int(cfg.get("training_seed",0)))
+    session=np.zeros((
+        3,reconstruction.residual_coefficient_rows,
+        reconstruction.residual_coefficient_columns),np.float32)
+    model=LightFieldModel.direct_fit_s(
+        session,base_texture=result.base_texture,
+        coordinate_frequencies=result.coordinate_frequencies,
+        geometry_feature_mean=result.geometry_feature_mean,
+        geometry_feature_scale=result.geometry_feature_scale,
+        geometry_pca_components=result.geometry_pca_components,
+        geometry_pca_scale=result.geometry_pca_scale,
+        local_geometry_feature_mean=result.local_geometry_feature_mean,
+        local_geometry_feature_scale=result.local_geometry_feature_scale,
+        geometry_encoder_weights=result.geometry_encoder_weights,
+        geometry_encoder_biases=result.geometry_encoder_biases,
+        gru_input_weight=result.gru_input_weight,
+        gru_recurrent_weight=result.gru_recurrent_weight,
+        gru_bias=result.gru_bias,warp_weight=result.warp_weight,
+        warp_bias=result.warp_bias,
+        color_trunk_weights=result.color_trunk_weights,
+        color_trunk_biases=result.color_trunk_biases,
+        channel_head_weights=result.channel_head_weights,
+        channel_head_biases=result.channel_head_biases,
+        geometry_descriptor_rows=direct.geometry_descriptor_rows,
+        curve_convexity=reconstruction.curve_convexity,
+        reconstruction_pipeline=CALIBRATION_RECONSTRUCTION_PIPELINE,
+        source_layout=source_layout)
+    model=_bind_material_model(model,reconstruction)
+    model.save(model_output)
+    print(
+        "direct_fit_s 已保存：可信平直帧="
+        f"{trusted_indices.size}，循环序列段={len(sequence_sequences)}，"
+        "warp=softmax[left,visible,right] 且 psi(s)=left+visible*s，"
+        f"model={model_output}")
+
 def main() -> None:
     parser=argparse.ArgumentParser(description="JAX 离线标定无局部形变背景光场")
     parser.add_argument("--config",default=Path(__file__).with_name("config.yaml")); args=parser.parse_args()
-    config_path=Path(args.config).expanduser(); all_config=yaml.safe_load(config_path.read_text(encoding="utf-8")); raw=all_config["lightfield"]
+    config_path=Path(args.config).expanduser(); all_config=load_config(config_path); raw=all_config["lightfield"]
     cfg=raw["calibration"]
     background_method=parse_background_method(raw)
     model_output=resolve_background_model_path(
@@ -1012,17 +1577,15 @@ def main() -> None:
     reconstruction=parse_reconstruction_config(
         surface.get("reconstruction"),config_path=config_path,
         calibration_output=all_config.get("calibration",{}).get("output"))
-    source_layout=parse_light_source_layout(raw.get("light_source_layout"))
+    source_layout=(
+        parse_light_source_layout(raw.get("light_source_layout"))
+        if background_method=="physical_residual"
+        else DEFAULT_LIGHT_SOURCE_LAYOUT)
     output_dir=Path(cfg.get("sample_output_dir","assets/lightfield_calibration")).expanduser()
     if not output_dir.is_absolute(): output_dir=config_path.parent/output_dir
-    image_paths=_resolve_optional_paths(
-        cfg.get("images"),config_path.parent,"lightfield.calibration.images")
-    video_paths=_resolve_optional_paths(
-        cfg.get("videos"),config_path.parent,"lightfield.calibration.videos")
-    if not image_paths and not video_paths:
-        raise ValueError(
-            "lightfield.calibration.images 和 videos 至少需要配置一项")
-    video_frame_step=cfg.get("video_frame_step",1)
+    video_frame_step=(
+        cfg.get("direct_fit_s_video_frame_step",cfg.get("video_frame_step",1))
+        if background_method=="direct_fit_s" else cfg.get("video_frame_step",1))
     video_max_frames=cfg.get("video_max_frames_per_file")
     reuse_existing=bool(cfg.get("reuse_existing",True))
     video_frame_dir=Path(
@@ -1030,9 +1593,49 @@ def main() -> None:
     ).expanduser()
     if not video_frame_dir.is_absolute():
         video_frame_dir=config_path.parent/video_frame_dir
-    video_frame_paths=extract_video_frames(
-        video_paths,video_frame_dir,frame_step=video_frame_step,
-        max_frames_per_file=video_max_frames,reuse_existing=reuse_existing)
+    trusted_flat_frame_paths: list[Path]=[]
+    sequence_frame_paths: list[Path]=[]
+    if background_method=="direct_fit_s":
+        trusted_videos=_resolve_optional_paths(
+            cfg.get("trusted_flat_videos"),config_path.parent,
+            "lightfield.calibration.trusted_flat_videos")
+        sequence_videos=_resolve_optional_paths(
+            cfg.get("sequence_videos"),config_path.parent,
+            "lightfield.calibration.sequence_videos")
+        if not trusted_videos or not sequence_videos:
+            raise ValueError(
+                "direct_fit_s 必须同时配置 trusted_flat_videos 和 "
+                "sequence_videos")
+        trusted_video_set={path.expanduser().resolve()
+                           for path in trusted_videos}
+        sequence_video_set={path.expanduser().resolve()
+                            for path in sequence_videos}
+        if trusted_video_set&sequence_video_set:
+            raise ValueError(
+                "direct_fit_s 的可信平直视频和循环视频不能包含同一文件")
+        trusted_flat_frame_paths=extract_video_frames(
+            trusted_videos,video_frame_dir,frame_step=video_frame_step,
+            max_frames_per_file=video_max_frames,reuse_existing=reuse_existing,
+            group_prefix="trusted_flat_video")
+        sequence_frame_paths=extract_video_frames(
+            sequence_videos,video_frame_dir,frame_step=video_frame_step,
+            max_frames_per_file=video_max_frames,reuse_existing=reuse_existing,
+            group_prefix="bend_sequence_video")
+        image_paths=[]
+        video_frame_paths=[*trusted_flat_frame_paths,*sequence_frame_paths]
+    else:
+        image_paths=_resolve_optional_paths(
+            cfg.get("images"),config_path.parent,
+            "lightfield.calibration.images")
+        video_paths=_resolve_optional_paths(
+            cfg.get("videos"),config_path.parent,
+            "lightfield.calibration.videos")
+        if not image_paths and not video_paths:
+            raise ValueError(
+                "lightfield.calibration.images 和 videos 至少需要配置一项")
+        video_frame_paths=extract_video_frames(
+            video_paths,video_frame_dir,frame_step=video_frame_step,
+            max_frames_per_file=video_max_frames,reuse_existing=reuse_existing)
     observation_image_paths=[*image_paths,*video_frame_paths]
     map_dir=Path(cfg.get("generated_map_dir","assets/lightfield_calibration/maps")).expanduser()
     if not map_dir.is_absolute(): map_dir=config_path.parent/map_dir
@@ -1040,17 +1643,29 @@ def main() -> None:
     if not isinstance(saturation_threshold,int) or isinstance(saturation_threshold,bool) \
             or not 1<=saturation_threshold<=255:
         raise ValueError("lightfield.calibration.saturation_threshold 必须是 1..255 的整数")
-    print(f"标定输入: 图片 {len(image_paths)} 张，视频帧 {len(video_frame_paths)} 张"
-          f"（reuse_existing={reuse_existing}）")
+    if background_method=="direct_fit_s":
+        print(
+            f"direct_fit_s 标定输入: 可信平直帧 {len(trusted_flat_frame_paths)}，"
+            f"非可信循环帧 {len(sequence_frame_paths)}"
+            f"（reuse_existing={reuse_existing}）")
+    else:
+        print(f"标定输入: 图片 {len(image_paths)} 张，视频帧 {len(video_frame_paths)} 张"
+              f"（reuse_existing={reuse_existing}）")
     paths=reconstruct_all_observations(
         observation_image_paths,all_config,config_path,output_dir,map_dir,
         saturation_threshold,filter_original_saturation=False,
         reuse_existing=reuse_existing)
     device=choose_device(raw.get("device","gpu"))
-    xyz_parts=[]; uv_parts=[]; st_parts=[]; depth_parts=[]; rgb_parts=[]; valid_parts=[]; source_images=[]
+    xyz_parts=[]; raw_xyz_parts=[]; uv_parts=[]; st_parts=[]; depth_parts=[]
+    rgb_parts=[]; valid_parts=[]; source_images=[]; sequence_ids=[]
+    sequence_frame_indices=[]
     for path in paths:
         with np.load(path) as data:
             xyz_parts.append(data["xyz"]); uv_parts.append(data["uv"])
+            if "raw_observed_xyz" not in data:
+                raise ValueError(
+                    f"标定样本缺少归一化前 raw_observed_xyz，请重新生成: {path}")
+            raw_xyz_parts.append(data["raw_observed_xyz"])
             if "st" not in data:
                 raise ValueError(f"标定样本缺少 st，请重新生成: {path}")
             st_parts.append(data["st"])
@@ -1059,6 +1674,9 @@ def main() -> None:
             depth_parts.append(data["camera_depth"])
             rgb_parts.append(data["rgb"]); valid_parts.append(data["valid_mask"])
             source_images.append(Path(str(data["source_image"])))
+            sequence_ids.append(str(data["material_sequence_id"]))
+            sequence_frame_indices.append(int(
+                data["material_sequence_frame_index"]))
     # 实时 JAX 重建无效的帧不会进入缓存；依据成功缓存恢复真实输入顺序，
     # 避免训练/验证划分继续引用已跳过的原始图像。
     observation_image_paths=source_images.copy()
@@ -1069,18 +1687,20 @@ def main() -> None:
     try:
         # 全量数据只保留在 CPU；Adam 和后续物理预测仅把当前 batch 送入 GPU。
         xyz=np.asarray(np.stack(xyz_parts),dtype=np.float32)
+        raw_xyz=np.asarray(np.stack(raw_xyz_parts),dtype=np.float32)
         observed=np.asarray(np.stack(rgb_parts),dtype=np.float32)
         valid=np.asarray(np.stack(valid_parts),dtype=np.bool_)
         # 当前物理模型只消费 XYZ；仍在这里堆叠 ST，以同步校验所有样本的网格结构。
         np.stack(st_parts)
     except ValueError as error:
         raise ValueError("所有标定样本必须使用相同的曲面网格尺寸") from error
-    del xyz_parts,rgb_parts,valid_parts,st_parts
+    del xyz_parts,raw_xyz_parts,rgb_parts,valid_parts,st_parts
     print(
         "标定观测已由实时 JAX 重建链生成："
         f"convexity={reconstruction.curve_convexity}；"
         "XYZ/UV/depth 无事后补投影")
-    validation_fraction=float(cfg.get("validation_fraction",0.))
+    validation_fraction=(0. if background_method=="direct_fit_s" else
+                         float(cfg.get("validation_fraction",0.)))
     validation_seed=cfg.get("validation_seed",0)
     training_indices,validation_indices=_split_calibration_indices(
         observation_image_paths,independent_image_count,validation_fraction,
@@ -1097,17 +1717,8 @@ def main() -> None:
                                 else "uniform_huber")
     if configured_residual_method not in {"uniform","uniform_huber"}:
         raise ValueError("local_reconstruction.residual_method 无效")
-    if background_method=="geometry_cache":
-        _calibrate_geometry_cache(
-            raw=raw,cfg=cfg,reconstruction=reconstruction,device=device,
-            source_layout=source_layout,source_images=source_images,
-            uv_parts=uv_parts,depth_parts=depth_parts,xyz_all=xyz,
-            training_indices=training_indices,
-            validation_indices=validation_indices,
-            model_output=model_output)
-        return
-    if background_method in {"direct_fit","direct_fit_3"}:
-        _calibrate_direct_fit(
+    if background_method=="direct_fit_3":
+        _calibrate_direct_fit_3(
             raw=raw,cfg=cfg,reconstruction=reconstruction,device=device,
             background_method=background_method,
             source_layout=source_layout,source_images=source_images,
@@ -1115,6 +1726,35 @@ def main() -> None:
             training_indices=training_indices,
             validation_indices=validation_indices,
             model_output=model_output)
+        return
+    if background_method=="direct_fit_s":
+        trusted_sources={path.expanduser().resolve()
+                         for path in trusted_flat_frame_paths}
+        sequence_sources={path.expanduser().resolve()
+                          for path in sequence_frame_paths}
+        trusted_indices=np.asarray([
+            index for index,path in enumerate(source_images)
+            if path.expanduser().resolve() in trusted_sources],np.int64)
+        bend_indices=np.asarray([
+            index for index,path in enumerate(source_images)
+            if path.expanduser().resolve() in sequence_sources],np.int64)
+        if trusted_indices.size+bend_indices.size!=len(source_images):
+            raise RuntimeError("direct_fit_s 观测角色映射不完整")
+        direct_s=parse_direct_fit_s_config(raw)
+        frame_index_values=np.asarray(sequence_frame_indices,np.int64)
+        trusted_sequences=_contiguous_role_sequences(
+            trusted_indices,sequence_ids,frame_index_values,
+            maximum_gap=direct_s.maximum_sequence_gap)
+        bend_sequences=_contiguous_role_sequences(
+            bend_indices,sequence_ids,frame_index_values,
+            maximum_gap=direct_s.maximum_sequence_gap)
+        _calibrate_direct_fit_s(
+            raw=raw,cfg=cfg,reconstruction=reconstruction,device=device,
+            source_layout=source_layout,source_images=source_images,
+            uv_parts=uv_parts,depth_parts=depth_parts,xyz_all=xyz,
+            raw_xyz_all=raw_xyz,trusted_indices=trusted_indices,
+            trusted_sequences=trusted_sequences,
+            sequence_sequences=bend_sequences,model_output=model_output)
         return
     # 物理路径也只用训练划分拟合；保留完整数组供最后的留出集诊断。
     xyz_all=xyz; observed_all=observed; valid_all=valid
@@ -1498,6 +2138,7 @@ def main() -> None:
         physical_model.mixing_matrix,jnp.asarray(residual_b),
         jnp.asarray(residual_ms),physical_model.source_layout)
     output=model_output
+    final_model=_bind_material_model(final_model,reconstruction)
     final_model.save(output)
     b_field=evaluate_rgb_bspline(residual_b,(residual_sample_rows,residual_sample_columns))
     m_fields=np.stack([evaluate_rgb_bspline(item,(residual_sample_rows,residual_sample_columns))

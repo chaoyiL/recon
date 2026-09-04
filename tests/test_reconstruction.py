@@ -22,6 +22,7 @@ from utils.process import (
     _rotation,
     _solve_smoothed_shared_curve,
     build_reconstruction_point_set,
+    extract_mask_side_boundaries,
 )
 
 
@@ -182,14 +183,37 @@ class EdgeReconstructorTest(unittest.TestCase):
         with patch(
             "utils.process._optimize_shared_curve",
             wraps=process_module._optimize_shared_curve,
-        ) as optimize:
+        ) as optimize, patch(
+            "utils.process._monotone_right_matches",
+            wraps=process_module._monotone_right_matches,
+        ) as match:
             reconstructor.process(segments, float(np.mean(pixels[:, 0])))
             first_frame_calls = optimize.call_count
+            first_frame_matches = match.call_count
             reconstructor.process(segments, float(np.mean(pixels[:, 0])))
 
         self.assertTrue(reconstructor.calibrated)
-        self.assertEqual(first_frame_calls, 2)
+        self.assertGreaterEqual(first_frame_calls, 2)
+        self.assertLessEqual(
+            first_frame_calls, reconstructor.matching_refinement_iterations
+        )
+        self.assertEqual(first_frame_matches, first_frame_calls)
         self.assertEqual(optimize.call_count, first_frame_calls)
+        self.assertEqual(match.call_count, first_frame_matches + 1)
+
+    def test_mask_side_boundaries_exclude_horizontal_edge_interior(self) -> None:
+        mask = np.zeros((18, 24), dtype=np.bool_)
+        mask[5:15, 4:20] = True
+        mask[9:12, 10:14] = False  # 内部孔洞不应改变外包络。
+
+        left, right = extract_mask_side_boundaries(mask)
+
+        np.testing.assert_array_equal(left[:, 0], np.full(10, 4.0))
+        np.testing.assert_array_equal(right[:, 0], np.full(10, 19.0))
+        np.testing.assert_array_equal(left[:, 1], np.arange(5.0, 15.0))
+        np.testing.assert_array_equal(right[:, 1], np.arange(5.0, 15.0))
+        top_points = np.concatenate([left[left[:, 1] == 5], right[right[:, 1] == 5]])
+        np.testing.assert_array_equal(top_points[:, 0], [4.0, 19.0])
 
     def test_second_difference_term_smooths_linear_solution(self) -> None:
         rng = np.random.default_rng(3)
@@ -268,8 +292,7 @@ class EdgeReconstructorTest(unittest.TestCase):
             mask[0,row,10+row//20:70-row//30]=True
         refined,left,right,valid=prepare_edge_curves_from_masks_jax(
             jnp.asarray(mask),jnp.asarray(self.K,np.float32),
-            jnp.zeros(5,jnp.float32),16,5.,close_kernel=3,
-            open_kernel=3,blur_kernel=5)
+            jnp.zeros(5,jnp.float32),16)
         self.assertEqual(refined.shape,(1,64,80))
         self.assertEqual(left.shape,(1,16,2))
         self.assertEqual(right.shape,(1,64,2))
@@ -277,13 +300,31 @@ class EdgeReconstructorTest(unittest.TestCase):
         self.assertTrue(np.all(np.diff(np.asarray(left[0,:,1]))>=0))
         self.assertTrue(np.all(np.asarray(left[0,:,0])<np.asarray(right[0,::4,0])))
 
-    def test_jax_mask_path_rejects_narrow_or_empty_surface(self) -> None:
-        masks=np.zeros((2,32,40),bool)
+    def test_jax_mask_path_accepts_narrow_rows_without_center_band(self) -> None:
+        masks=np.zeros((3,32,40),bool)
         masks[0,8:24,18:21]=True
+        masks[1,8:24,19:20]=True
         _,_,_,valid=prepare_edge_curves_from_masks_jax(
             jnp.asarray(masks),jnp.asarray(self.K,np.float32),
-            jnp.zeros(5,jnp.float32),8,5.)
-        np.testing.assert_array_equal(np.asarray(valid),[False,False])
+            jnp.zeros(5,jnp.float32),8)
+        np.testing.assert_array_equal(np.asarray(valid),[True,False,False])
+
+    def test_jax_mask_path_excludes_endpoints_without_cropping_mask(self) -> None:
+        mask=np.zeros((1,64,80),bool)
+        mask[0,10:50,12:68]=True
+        refined,left,right,valid=prepare_edge_curves_from_masks_jax(
+            jnp.asarray(mask),jnp.asarray(self.K,np.float32),
+            jnp.zeros(5,jnp.float32),16,side_edge_exclusion_ratio=.1)
+        np.testing.assert_array_equal(np.asarray(refined),mask)
+        self.assertTrue(bool(valid[0]))
+        self.assertAlmostEqual(float(left[0,0,1]),14.)
+        self.assertAlmostEqual(float(left[0,-1,1]),45.)
+        self.assertAlmostEqual(float(right[0,0,1]),14.)
+        self.assertAlmostEqual(float(right[0,-1,1]),45.)
+        with self.assertRaisesRegex(ValueError,"位于"):
+            prepare_edge_curves_from_masks_jax(
+                jnp.asarray(mask),jnp.asarray(self.K,np.float32),
+                jnp.zeros(5,jnp.float32),16,side_edge_exclusion_ratio=.5)
 
     def test_shared_realtime_mask_entry_matches_explicit_jax_pipeline(self) -> None:
         mask=np.zeros((1,64,80),bool)
@@ -295,14 +336,13 @@ class EdgeReconstructorTest(unittest.TestCase):
         inverse=jnp.asarray(np.linalg.inv(self.K),np.float32)
         rotation=jnp.eye(3,dtype=jnp.float32)
         refined,left,right,edge_valid=prepare_edge_curves_from_masks_jax(
-            masks,camera,distortion,16,5.,close_kernel=3,
-            open_kernel=3,blur_kernel=5)
+            masks,camera,distortion,16,side_edge_exclusion_ratio=.05)
         explicit=(*reconstruct_surface_batch_jax(
             left,right,camera,distortion,rotation,11.,-11.,0.,4,10.,2.,
             inverse),)
         shared=reconstruct_surface_from_masks_jax(
-            masks,camera,distortion,inverse,rotation,11.,-11.,0.,16,5.,4,
-            10.,2.,close_kernel=3,open_kernel=3,blur_kernel=5)
+            masks,camera,distortion,inverse,rotation,11.,-11.,0.,16,4,
+            10.,2.,side_edge_exclusion_ratio=.05)
         np.testing.assert_array_equal(np.asarray(shared[0]),np.asarray(refined))
         for actual,expected in zip(shared[1:6],explicit[:5],strict=True):
             np.testing.assert_allclose(np.asarray(actual),np.asarray(expected))

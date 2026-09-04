@@ -24,6 +24,7 @@ class CameraControlTest(unittest.TestCase):
         cap.set.return_value=True
         cap.get.side_effect=lambda prop: {
             cv2.CAP_PROP_AUTO_WB:0.,cv2.CAP_PROP_WB_TEMPERATURE:4600.,
+            cv2.CAP_PROP_AUTOFOCUS:0.,cv2.CAP_PROP_EXPOSURE:170.,
         }.get(prop,0.)
         video_capture.return_value=cap
 
@@ -32,6 +33,7 @@ class CameraControlTest(unittest.TestCase):
         self.assertIs(actual,cap)
         cap.set.assert_any_call(cv2.CAP_PROP_AUTO_WB,0)
         cap.set.assert_any_call(cv2.CAP_PROP_WB_TEMPERATURE,4600)
+        cap.set.assert_any_call(cv2.CAP_PROP_AUTOFOCUS,0)
 
     @patch("utils.camera.cv2.VideoCapture")
     def test_open_camera_rejects_ignored_manual_white_balance(self,video_capture):
@@ -40,10 +42,25 @@ class CameraControlTest(unittest.TestCase):
         cap.set.return_value=True
         cap.get.side_effect=lambda prop: {
             cv2.CAP_PROP_AUTO_WB:1.,cv2.CAP_PROP_WB_TEMPERATURE:4600.,
+            cv2.CAP_PROP_AUTOFOCUS:0.,cv2.CAP_PROP_EXPOSURE:170.,
         }.get(prop,0.)
         video_capture.return_value=cap
 
         with self.assertRaisesRegex(RuntimeError,"自动白平衡未成功关闭"):
+            open_camera(4,170,4600,None,None)
+        cap.release.assert_called_once()
+
+    @patch("utils.camera.cv2.VideoCapture")
+    def test_open_camera_rejects_ignored_manual_focus(self,video_capture):
+        cap=MagicMock()
+        cap.isOpened.return_value=True
+        cap.set.return_value=True
+        cap.get.side_effect=lambda prop: {
+            cv2.CAP_PROP_AUTOFOCUS:1.,cv2.CAP_PROP_EXPOSURE:170.,
+        }.get(prop,0.)
+        video_capture.return_value=cap
+
+        with self.assertRaisesRegex(RuntimeError,"自动对焦未成功关闭"):
             open_camera(4,170,4600,None,None)
         cap.release.assert_called_once()
 

@@ -2,7 +2,7 @@
 
 本文说明本仓库当前实际执行的完整重建链路：
 
-1. 从相机图像和 SAM2 掩膜恢复整体规则曲面；
+1. 从相机图像和 PP-LiteSeg 掩膜恢复整体规则曲面；
 2. 按配置选择“物理光场 + 残差拟合”或“绝对背景纯拟合”；
 3. 用会话 $B/M$ 基底净化线性 RGB 色差；
 4. 用已知半径球建立“色差到局部坡度”的查找表；
@@ -50,7 +50,7 @@ $$
 
 ```mermaid
 flowchart LR
-    Frame[相机BGR帧] --> Mask[SAM2掩膜]
+    Frame[相机BGR帧] --> Mask[PP-LiteSeg掩膜]
     Mask --> Edges[左右侧边缘]
     Edges --> Global[整体XYZ与UV/ST]
     Global --> Physical[物理光场路径]
@@ -114,11 +114,15 @@ $$
 整体网格行列记为 $(i,j)$。规范坐标为
 
 $$
-s_i=\frac{i}{N-1},\qquad
+s_i=\frac{\sum_{k<i}L_k}{\sum_kL_k},\qquad
 t_j=\frac{j}{F+1},
 $$
 
-其中 $N$ 是截面数，$F$ 是每个截面的内部补点数。左右边界分别满足
+其中 $L_k=\texttt{length\_mm}/(N-1)$ 由配置中的已知物理全长直接生成，$N$ 是材料
+截面数，$F$ 是每个截面的内部补点数。均匀材料行的数值为 $i/(N-1)$；它来自固定
+物理尺寸和顶点身份，而不是当前帧可见轮廓的首末行。`s_zero_endpoint=image_top`
+时图像上端为 $s=0$，`image_bottom` 时图像下端为 $s=0$。端点被遮挡时，
+隐藏顶点继续保留原有 $s$，绝不把可见子区重新铺满 $[0,1]$。左右边界分别满足
 $t=0$ 和 $t=1$。
 
 代码中的 `uv` 是原图像素坐标，`st` 是规范曲面坐标。两者不能混用。
@@ -198,39 +202,139 @@ CPU 路径用 OpenCV 去畸变；实时 JAX 路径用固定五次迭代反解该
 
 ## 4. 从掩膜得到左右边缘
 
-### 4.1 SAM2 分割
+### 4.1 PP-LiteSeg 曲面分割
 
-`get_surface.prompts` 为每个 label 提供正负提示点。SAM2 输出二值掩膜。
+重建、标定和实时渲染只接受 `get_surface.segmentation.mode: liteseg`。
+PP-LiteSeg 加载训练导出的 Paddle 静态模型，输出配置 `foreground_class`
+对应的单个二值掩膜。SAM2 只在 `PP-LiteSeg/auto_label.py` 中生成教师标签；
+`sam2_preview.py` 用于检查同一教师逻辑，不进入重建运行时。
+学生掩膜与教师标签进入完全相同的掩膜清理和后续曲面重建。
 整体重建只使用掩膜外边界，不使用掩膜内部纹理。
 
-### 4.2 CPU 路径
+### 4.2 掩膜清理
 
-CPU/离线路径执行：
+PP-LiteSeg 输出先在 CPU 执行：
 
-1. 椭圆核闭运算填小洞；
-2. 椭圆核开运算去孤立噪声；
-3. 可选保留最大连通域；
-4. 填充最大外轮廓；
-5. 高斯平滑；
-6. 提取外轮廓并删除中轴带
-   $u\in[u_0-d,u_0+d]$；
-7. 按左右位置拆分轮廓，按 $v$ 聚合；
-8. 左边缘按弧长重采样为 $N$ 点，右边缘重采样为 $4N$ 点。
+1. 保留面积最大的外轮廓；
+2. 填充该轮廓内部孔洞；
+3. 将清理后的 mask 上传 JAX 重建入口。
 
-右边缘更稠密是为了后续单调动态规划配对。
+不执行闭运算、开运算、高斯模糊、中轴带删除、圆角删除或尖角恢复；分割模型产生的
+最大外轮廓形状保持不变。后续 JAX 重建也不提取物理端边。
+
+整体重建另使用 `side_edge_exclusion_ratio` 定义侧边采样区间：以每个 mask 的
+有效高度为基准，上下端各排除该比例的行。这个阈值只过滤送入整体重建的左右
+包络点，不裁剪或修改清理后的 mask；设为 `0` 可关闭，`0.02` 表示上下各 2%。
 
 ### 4.3 实时 JAX 路径
 
-实时路径为了固定形状和 GPU 吞吐，使用正方形窗口形态学，并在每个有效图像行取
-最左和最右像素，再做行方向平滑和规则重采样。它不是 OpenCV 外轮廓弧长重采样的
-逐点等价实现。
+光场/法向离线标定和实时重建统一消费上述清理 mask。左右侧平面观测按端部比例
+排除圆角行，再逐行取最左/最右像素；左边缘重采样为 $N$ 点，右边缘重采样为
+$4N$ 点，后者用于单调动态规划配对和中央 YZ 曲线求解。程序不读取上下包络、不拟合
+横向封口线，也不补回、分类或锚定物理端边。2% 参数仅隔离容易受圆角污染的侧边行。
 
 因此：
 
-- CPU 与 JAX 共享后续几何模型；
-- 两者边缘观测可能不同；
-- 光场和法向离线标定使用 CPU 轮廓路径；
-- `get-surface` 与实时渲染使用同一个 JAX 逐行边缘及整体重建入口。
+- 光场/法向离线标定、`get-surface` 与实时渲染统一使用 JAX
+  逐行边缘及固定材料状态入口；
+- Python/CPU 只保留首次有效帧的受限外参 bootstrap。
+
+### 4.4 配置尺寸材料模板与状态
+
+材料模板不再通过相机采集，也不再读写 NPZ 文件。程序从
+`material_surface.width_mm`、`length_mm`、`s_zero_endpoint` 和 `geometry_grid`
+确定性生成固定 `st`、均匀逐段长度和横向坐标。宽度以中心面 $X=0$ 对称展开，
+左右已知平面分别为 $X=-W/2$ 与 $X=W/2$。模板指纹同时绑定相机和重建语义，
+尺寸、端点方向、网格或相机配置改变后，旧光场模型和法向 LUT 会被拒绝。
+
+首帧前只建立一个 `valid=false`、可见域为空、置信度为零的直线占位状态；它只保证
+JAX 输入形状稳定，不能参与渲染或标定。首个结构有效的几何观测会整体替换它。
+
+设模板材料行数为 $N$，固定段长为 $L_i$，规则轮廓重建出的观测中心线为
+$\widehat{\mathbf q}_i=(\widehat Y_i,\widehat Z_i)$。程序不从二值 mask 识别物理端边，
+也不判断当前轮廓是完整材料还是遮挡后的子段。观测切向角为
+
+$$
+\widehat\theta_i=\operatorname{atan2}
+(\widehat Z_{i+1}-\widehat Z_i,\widehat Y_{i+1}-\widehat Y_i).
+$$
+
+先以零原点和固定段长构造形状
+
+$$
+\mathbf r_0=\mathbf0,\qquad
+\mathbf r_{i+1}=\mathbf r_i+
+L_i(\cos\widehat\theta_i,\sin\widehat\theta_i),
+$$
+
+再求仅含平移的最小二乘解
+
+$$
+\mathbf o^\star=\arg\min_{\mathbf o}
+\sum_i\|\widehat{\mathbf q}_i-(\mathbf o+\mathbf r_i)\|_2^2
+=\frac1N\sum_i(\widehat{\mathbf q}_i-\mathbf r_i).
+$$
+
+首次状态为 $\mathbf q_i=\mathbf o^\star+\mathbf r_i$。长度差只可作为诊断量，不能
+成为材料身份或完整性的判据。
+
+在线帧先按当前 YZ 中心线的三维累计弧长同步重采样 XYZ 和左右 UV。设重采样后的
+累计观测弧长为 $\ell_i$，模板累计材料长度为
+
+$$
+S_0=0,\qquad S_j=\sum_{k<j}L_k.
+$$
+
+每一帧都把当前可见轮廓的累计弧长统一归一到整个配置模板区间：
+
+$$
+\widehat S_i^t=\ell_i\frac{S_{N-1}}{\ell_{N-1}}.
+$$
+
+再以 $(\widehat S_i^t,\widehat{\mathbf q}_i)$ 把当前曲线和左右 UV 同步插值到固定
+模板行，所有模板行都标记为当前轮廓可观测。当前角度和原点直接替换上一状态，不做
+单端锚定、隐藏段传播、子段搜索或时间混合。可选的单向弯曲投影仍只约束物理形状。
+
+最终中心线仍按
+
+$$
+\mathbf q_{i+1}=\mathbf q_i+
+L_i(\cos\theta_i,\sin\theta_i)
+$$
+
+重建，因此每段长度在数值精度内恒等于模板静止长度。
+
+首次对齐完成后，在线追踪阶段不设覆盖率、匹配距离、RMS 或 confidence 接受门限。
+只在观测重建无效、坐标非有限、深度非正、候选几何无效或 UV 三角形超过安全光栅
+容量时回滚到上一结构有效状态。每帧输出连续匹配置信度。当前可见比例恒为 1；记
+当前归一化轮廓与上一状态整曲线的 YZ RMS 为 $d$，当前边缘 RMS 为 $r$，配置尺度为
+$\sigma_d,\sigma_r$，则正常情况下
+
+$$
+C=c_v\exp\left[-\frac12(d/\sigma_d)^2\right]
+\exp\left[-\frac12(r/\sigma_r)^2\right]c_f,
+$$
+
+其中 $c_f$ 是有限观测行比例。$C$ 裁剪到 `[confidence_floor,1]`。在线帧只有在
+模板适应后的边界重投影 RMS 不超过 `calibration_maximum_rms_px` 且 $C$ 不低于
+`calibration_minimum_confidence` 时才进入标定集；这两个质量门限不回滚追踪状态。
+观测结构无效或出现非有限数值时令 $C$ 为 `confidence_floor` 并禁止提交该结构候选，避免
+NaN 传播。未完成首次结构有效的会话追踪初始化前仍禁止启动背景采样。
+
+模板网格投影后通过 GPU z-buffer 与分割掩膜求可见域。被遮挡顶点仍有预测 XYZ，
+但不能采样相机颜色、拟合 gain/bias、进入残差背景或局部位移方程。视频离线标定按
+帧序传播同一状态；独立图片没有前序状态，仍只能做严格的完整单帧对齐。
+
+光场离线重建会为每个输入帧原子保存一种互斥结果：成功帧保存观测 NPZ，未通过固定
+外参初始化或标定准入的帧保存 `*.reconstruction_failure.npz`，其中包括失败阶段、
+原因、质量量、源文件身份和重建配置指纹。再次运行时，只有逐帧成功数与失败数之和
+覆盖全部输入，并且所有身份和指纹校验通过，才直接复用成功样本并跳过整段时序重建；
+账本不完整时仍从序列起点重放，避免把缓存状态接到错误前驱。
+
+这一统一归一化只定义“当前轮廓参数”而不证明真实材料对应。曲面下部遮挡上部时，
+遮挡轮廓可以恰好是横贯材料的直线，在单目二值 mask 中与真实直端边不可辨。因此
+该类自遮挡帧的物理材料坐标在当前观测模型下不可识别；程序不会再用任何端边算法、
+长度阈值或时序猜测声称恢复了它。上下 2% 排除只用于避免圆角污染左右侧平面求解。
 
 ---
 
@@ -378,8 +482,12 @@ $$
 0.25\left(\frac{(j-j')-\Delta_0}{\Delta_0}\right)^2.
 $$
 
-端点固定为第一个和最后一个右边缘候选。首帧会在第一次联合标定后执行 DP，并用
-匹配结果再做一次联合优化；只有重投影 RMS 改善时才接受第二次结果。
+端点固定为第一个和最后一个右边缘候选。首帧交替执行“联合优化 → DP 匹配”，
+最多四次联合优化；匹配索引不再变化时提前停止。达到迭代上限时，返回历史中
+重投影 RMS 最小且曲线与对应关系属于同一轮的状态。
+
+该交替过程能减弱错误初始对应关系对外参的反馈，但不会从数学上消除外参、深度与
+自由共享曲线之间的病态耦合；绝对长度/端点可见性约束和更准确的成像模型仍然必要。
 
 ---
 
@@ -431,7 +539,7 @@ $$
 或投影后的左右边缘重投影 RMS 增量超过
 `curve_convexity_max_rms_increase_px`，整帧重建会被拒绝；不会回退输出非凸曲面。
 
-实时入口还显式保存上一有效 SAM 更新的状态
+实时入口还显式保存上一次有效分割更新的状态
 
 $$
 \mathcal T^{t-1}=\{\mathbf q^{t-1},\mathbf e_L^{t-1},
@@ -452,8 +560,8 @@ $$
 左右 UV 时间项作用于“实测边缘 UV 减 XYZ 重投影 UV”的误差
 $\mathbf e_L,\mathbf e_R$，而不是直接平滑最终 UV。这样真实 XYZ 运动仍可通过
 透视投影立即反映到 UV，只有容易受轮廓噪声影响的边界修正被约束。若中心曲线或
-UV 误差先验使观测重投影 RMS 增量超过各自门限，当前 SAM 更新无效，时间状态继续
-保留上一有效帧。SAM 复用的中间相机帧不会推进时间状态。
+UV 误差先验使观测重投影 RMS 增量超过各自门限，当前分割更新无效，时间状态继续
+保留上一有效帧。分割复用的中间相机帧不会推进时间状态。
 
 ---
 
@@ -590,15 +698,14 @@ $$
 
 ## 12. 背景方法与物理光场前向模型
 
-`lightfield.background.method` 选择背景模型：
+背景方法按配置文件选择：主 `config.yaml` 使用 `direct_fit_3`，独立的
+`config_physical_residual.yaml` 使用 `physical_residual`：
 
 - `physical_residual`：先计算物理背景，再用 $B/M$ 拟合其未解释的差值；
-- `direct_fit`：不计算物理光场或 gain/bias；由全局弯曲与逐点局部几何条件神经场
-  以一个共享 RGB decoder 输出背景；
 - `direct_fit_3`：共享同一个几何 encoder，但 R/G/B 分别拟合静态 $B_c$，并由三个
   相互独立、各自只输出一个通道的 decoder 预测 $\Delta B_c$。
 
-三种方法使用相同的标定图片、视频抽帧、整体重建、UV/ST 映射和三个网格，但分别
+两种方法使用相同的标定图片、视频抽帧、整体重建、UV/ST 映射和三个网格，但分别
 保存模型和法向 LUT。模型文件记录 `background_method`；
 运行时拒绝加载另一种语义的模型或 LUT。以下 12.1--12.4 只属于
 `physical_residual`。
@@ -700,13 +807,13 @@ $$
 
 `calibrate_lightfield.py` 对每张图片或抽取的视频帧独立执行：
 
-1. SAM2 分割；
+1. PP-LiteSeg 分割；
 2. CPU 整体重建；
 3. 生成规则 XYZ/UV/ST；
 4. 在线性 RGB 原图上按 UV 采样；
 5. 排除几何无效样本；饱和像素按相机实际裁剪输出保留。
 
-每个标定帧独立重置 SAM2 memory，避免视频记忆把标定样本耦合。
+PP-LiteSeg 对每个标定帧独立推理，不维护视频 memory。
 
 观测生成后才划分训练集和验证集，因此数据来源和抽帧方式不变。独立图片按
 `validation_seed` 确定性留出；每个视频留出连续尾段。只有训练集参与参数拟合，
@@ -714,7 +821,7 @@ $$
 
 ### 13.2 可学习物理参数
 
-本节和 13.3 只用于 `physical_residual`；`direct_fit` 从同一批观测直接进入第 14 节。
+本节和 13.3 只用于 `physical_residual`；`direct_fit_3` 从同一批观测直接进入第 14 节。
 
 离线物理模型学习：
 
@@ -781,7 +888,7 @@ $$
 利用光栅化得到的连续 $(s,t)$，把各帧有效残差采样到统一规范网格。有效域腐蚀只
 作用于几何投影外边界；不执行颜色饱和检查，也不会扩大内部饱和区域。
 
-`direct_fit` 和 `direct_fit_3` 不做上述相减，而是把相机绝对线性 RGB 直接采样到同一个
+`direct_fit_3` 不做上述相减，而是把相机绝对线性 RGB 直接采样到同一个
 `observation_grid`：
 
 $$
@@ -803,9 +910,9 @@ GPU 拟合采用空间权重、二阶差分平滑、幅值正则和固定轮次 
 
 物理路径随后仍按曲率引导回归学习 raw M，并保存
 $\{B,M_1^{\mathrm{raw}},\ldots,M_K^{\mathrm{raw}}\}$。以下条件神经场属于
-`direct_fit` 和 `direct_fit_3`。
+`direct_fit_3`。
 
-### 14.3 direct_fit/direct_fit_3 的弯曲状态与条件场
+### 14.3 direct_fit_3 的弯曲状态与条件场
 
 对整体规则点云 $\mathbf X\in\mathbb R^{H_g\times W_g\times3}$，先构造
 
@@ -854,18 +961,19 @@ $$
 \sin(2\pi f_jt),\cos(2\pi f_jt)\}_{j=1}^{J}\right],
 $$
 
-仅有全局向量会把整张曲面压缩过度，因此还在查询位置双线性采样 15 维局部
+仅有全局向量会把整张曲面压缩过度，因此还在查询位置双线性采样 10 维局部
 几何条件
 
 $$
 \mathbf q(s,t;\mathbf X)=
-[\mathbf X,\mathbf n,\mathbf t_{\rm center},
-\boldsymbol\kappa_{\rm center},
-\mathbf X-\mathbf x_{\rm center}]_{(s,t)}.
+[X,Y,Z,n_Y,n_Z,t_Y,t_Z,\kappa_Y,\kappa_Z,
+X-X_{\rm center}]_{(s,t)}.
 $$
 
 它包含当前空间位置、曲面法向、中心线切向/曲率和截面横向偏移，并使用训练集
-统计量逐维标准化。位置、学习型/确定性全局弯曲状态和局部几何共同构成
+统计量逐维标准化。直纹面模型中恒为零的 $n_X,t_X,\kappa_X$ 与横向偏移的
+$Y/Z$ 分量不再进入网络；保留它们会把浮点噪声除以极小标准差，制造无物理意义
+的光照条件。位置、学习型/确定性全局弯曲状态和局部几何共同构成
 
 $$
 \mathbf u=[\phi(s,t),\mathbf h_\psi(\mathbf X),
@@ -874,8 +982,8 @@ $$
 $$
 
 每个颜色的静态纹理 $B_c(s,t)$ 都使用该通道自身的标量 Huber 权重沿训练帧稳健
-聚合，不施加空间平滑。`direct_fit` 使用一个 SiLU 解码器输出三通道 logit 增量；
-`direct_fit_3` 使用三个结构相同但参数完全独立的 SiLU 解码器，每个只输出一个
+聚合，不施加空间平滑。`direct_fit_3` 使用三个结构相同但参数完全独立的 SiLU
+解码器，每个只输出一个
 通道：
 
 $$
@@ -892,7 +1000,7 @@ decoder 权重。
 $\mathcal L_{\rm abs}$。达到 255 的相机裁剪像素仍以线性值 1 参与监督；光栅几何
 有效域默认向内腐蚀 2 个图像像素，当前 `config.yaml` 显式设为 4。腐蚀发生在加入
 颜色信息之前，因此只收缩外边界，不会把内部饱和斑扩成训练空洞。
-训练还对随机坐标的行、列二阶差分施加平滑项。
+训练还对随机相邻坐标的一阶 RGB 差施加监督。
 
 为直接约束模型学到“几何变化造成的光变化”，先在 PCA 白化几何状态中为每个训练帧找
 `geometry_difference_neighbor_count` 个近邻，再随机选一帧 $j$，从两帧 observation grid
@@ -914,13 +1022,14 @@ $$
 
 差分项不建立新模型分支，也不恢复显式 $B/M$；它只在统一神经场上加入成对监督。
 `geometry_difference_weight=0` 可完全关闭该项。训练帧均匀轮转，帧内只从有效观测点抽样，
-并使用余弦衰减学习率。同帧坐标共享一次全局几何编码。在线只在 SAM 更新整体几何时把网络展开到
+并使用余弦衰减学习率。同帧坐标共享一次全局几何编码。在线只在分割更新整体几何时把网络展开到
 `residual_texture_grid`，中间相机帧采样缓存纹理。
 
 训练开始时从现有 validation 划分中均匀选取固定帧，每帧固定抽取一组有效点，以便各次
-校验使用完全相同的样本。每到 `validation_interval` 计算一次 RGB RMSE；任何更低的
-验证 RMSE 都会原子覆盖 `*.best_ckpt.npz`，其中保存模型参数、Adam 一/二阶矩、PCA 基与特征统计、
-最佳 step 和逐通道 RMSE。达到最小训练步数后，若连续 `early_stopping_patience` 次没有超过
+校验使用完全相同的样本。每到 `validation_interval` 计算一次绝对 RGB、几何差分和
+空间差分 RMSE；后两项只作诊断，checkpoint 排名严格只使用最终任务对应的绝对 RGB
+RMSE。任何更低的绝对验证 RMSE 都会原子覆盖 `*.best_ckpt.npz`，其中保存模型参数、
+Adam 一/二阶矩、PCA 基与特征统计、最佳 step 和逐通道 RMSE。达到最小训练步数后，若连续 `early_stopping_patience` 次没有超过
 `early_stopping_min_delta` 的改善则停止；无论是早停还是跑满预算，最终模型 YAML 都恢复严格最低
 验证 RMSE 对应的参数。
 
@@ -928,7 +1037,7 @@ direct 模型只保存
 $\{\boldsymbol\mu_z,\boldsymbol\sigma_z,\mathbf V_{D_p},\boldsymbol\sigma_p,
 \boldsymbol\mu_q,\boldsymbol\sigma_q,\psi,\theta,
 \Delta B_{\rm offline}\}$，不再保存显式 $M_k$ 或 M 分数回归。当前
-$\Delta B_{\rm offline}=0$，只作为后续会话修正的系数先验。模型格式升级为 14；
+$\Delta B_{\rm offline}=0$，只作为后续会话修正的系数先验。当前 direct 模型格式为 25；
 旧 direct 模型会被拒绝，必须重新运行 `calibrate-lightfield`，随后重新生成法向 LUT。
 
 ---
@@ -981,7 +1090,7 @@ $$
 再用同一套低频 B 样条 IRLS 拟合 $\Delta B_{\mathrm{session}}$。先验中心是模型中
 保存的 $\Delta B_{\mathrm{offline}}$（当前为零），控制系数按
 $[-d_{\rm session},d_{\rm session}]$ 裁剪，其中
-`direct_fit.session_correction_max_deviation`（`direct_fit_3` 未单独配置时复用该段）
+`direct_fit_3.session_correction_max_deviation`
 给出 $d_{\rm session}$。因此不会在每次
 启动时重新训练神经场，也不会让低频会话项取代几何相关背景。
 
@@ -1021,7 +1130,7 @@ $$
 因此总修正场在变换前后保持不变。raw M 没有重新学习，只是相对当前 Bsession
 做等价重参数化。
 
-`direct_fit` 不执行这一步，因为模型中已经没有显式 M。其总背景始终是
+`direct_fit_3` 不执行这一步，因为模型中已经没有显式 M。其总背景始终是
 $\widehat F_{\theta,\psi}(s,t;\mathbf X)+\Delta B_{\mathrm{session}}(s,t)$；会话项只处理
 曝光与装配造成的低频固定偏差。
 
@@ -1051,7 +1160,7 @@ $$
 +\Delta B_{\mathrm{session},c}(s_p,t_p),
 $$
 
-并在 SAM 更新间缓存。它不从当前图像求 M 分数，也不执行逐帧背景回归，因此接触信号
+并在分割更新间缓存。它不从当前图像求 M 分数，也不执行逐帧背景回归，因此接触信号
 不会反向改变弯曲状态。
 
 ### 16.2 uniform
@@ -1711,7 +1820,8 @@ $a_{ij}c_{ij}$、$\mathbf K$ 和 $\boldsymbol\gamma$ 的平均二次系数估计
 
 - 两轮频域 Poisson 初值；
 - `spectral_pcg`；
-- 最多 50 次实时精修。
+- 收敛容差 $10^{-4}$，最多 50 次实时精修；
+- PP-LiteSeg/整体几何和 Open3D 网格隔帧更新，局部色差与位移仍逐帧更新。
 
 离线 CPU `recon-local` 不使用频域初值或上一帧热启动。
 
@@ -1757,8 +1867,8 @@ Open3D 实时窗口关闭灯光，以线性 Turbo 色表显示有符号 $d$；�
 
 ### 26.1 `get-surface`
 
-- SAM2 mask 经 DLPack 直接交给 JAX，并使用与 `recon.py` 相同的 GPU mask
-  后处理和逐行边缘；
+- PP-LiteSeg 在 Paddle 中推理，掩膜在 CPU 执行与教师标签一致的 OpenCV
+  最大外轮廓/填洞/平滑后处理，再上传 JAX；
 - 首个有效帧仍在 CPU 标定外参，随后与 `recon.py` 共用 JAX 动态规划、整体曲线
   求解和规则构网；
 - 可保存整体点云和 UV/XYZ；
@@ -1781,13 +1891,14 @@ Open3D 实时窗口关闭灯光，以线性 Turbo 色表显示有符号 $d$；�
 
 ### 26.4 `render-lightfield` / `recon.py`
 
-- SAM2 保持在 PyTorch；
-- mask 经 DLPack 交给 JAX；
+- PP-LiteSeg 保持在 Paddle 推理端；
+- 掩膜完成统一 OpenCV 后处理后上传 JAX；
 - 首个有效帧仍在 CPU 用 SciPy 标定外参；
 - 稳态整体几何、所选背景方法、有符号色差和局部位移在 JAX/GPU；
 - OpenCV/Open3D 只负责采集和显示。
 
-当 `sam_frame_interval>1` 时，中间帧复用整体几何；direct 同时复用该几何对应的神经
+当 `get_surface.segmentation.liteseg.frame_interval>1` 时，中间帧复用整体几何；
+direct 同时复用该几何对应的神经
 背景纹理。相机颜色和局部位移仍每帧更新；物理路径的背景分数及 gain/bias 也每帧更新。
 
 ### 26.5 `recon-local`
@@ -1803,7 +1914,9 @@ Open3D 实时窗口关闭灯光，以线性 Turbo 色表显示有符号 $d$；�
 
 ### 27.1 整体几何
 
-- `s1`, `s2`：两侧已知平面和绝对毫米尺度；
+- `material_surface.width_mm`：模板横向宽度；两侧平面自动取 $\pm W/2$；
+- `material_surface.length_mm`：模板纵向物理全长和固定段长尺度；
+- `material_surface.s_zero_endpoint`：图像上端或下端对应材料 $s=0$；
 - `geometry_grid.rows`：截面数 $N$；
 - `geometry_grid.columns`：$F+2$；
 - `lightfield_grid`：物理积分和光栅化采样密度；
@@ -1816,28 +1929,27 @@ Open3D 实时窗口关闭灯光，以线性 Turbo 色表显示有符号 $d$；�
 - `curve_convexity_max_rms_increase_px`：凸投影可接受的最大重投影 RMS 增量；
 - `temporal_prior.curve_*`：上一有效中心曲线的位置先验、Huber 尺度和 RMS 门限；
 - `temporal_prior.uv_error_*`：左右 UV 投影误差的位置先验、Huber 尺度和 RMS 门限；
-- `center_band_d`：从掩膜轮廓删除的中轴带半宽。
+- 侧边提取固定为逐行左右包络，不再有 `center_band_d` 配置。
 
 ### 27.2 物理光场
 
-- `background.method`：选择 `physical_residual`、`direct_fit` 或 `direct_fit_3`；
-- `background.model_files`：三种方法各自的模型文件，禁止覆盖混用；
-- `direct_fit.sample_filter.saturation_threshold`：旧配置兼容字段；当前不用于删除样本；
-- `direct_fit.sample_filter.erode_pixels`：direct 光栅有效域的图像像素内缩量；
-- `direct_fit.neural_field.frequencies`：规范位置的 Fourier 坐标频率；
-- `direct_fit.neural_field.geometry_descriptor_rows`：中心线、曲率、宽度和法向采样数；
-- `direct_fit.neural_field.geometry_encoder_*`：全局几何编码器容量；
-- `direct_fit.neural_field.geometry_latent_dimensions`：弯曲状态隐向量维数；
-- `direct_fit.neural_field.geometry_pca_dimensions`：标准化全局几何的 PCA 直连维数；
-- `direct_fit.neural_field.decoder_*`：位置—全局/局部几何解码器容量；在
-  `direct_fit_3` 中分别应用到三个标量 decoder；
-- `direct_fit.neural_field.steps/batch_size/frame_batch_size/learning_rate`：训练预算；
-- `direct_fit.neural_field.smooth_lambda`：输出场坐标二阶差分平滑强度；
-- `direct_fit.neural_field.geometry_difference_*`：PCA 几何近邻数量、共同坐标采样数和
+- 主 `config.yaml` 的 `background.method` 固定为 `direct_fit_3`；
+- `config_physical_residual.yaml` 通过 `extends: config.yaml` 启用物理链路并集中保存
+  灯带、积分、扩散和物理 B/M 参数；
+- `model_file`：当前配置所选方法的模型文件；
+- `direct_fit_3.sample_filter.erode_pixels`：direct 光栅有效域的图像像素内缩量；
+- `direct_fit_3.neural_field.frequencies`：规范位置的 Fourier 坐标频率；
+- `direct_fit_3.neural_field.geometry_descriptor_rows`：中心线、曲率、宽度和法向采样数；
+- `direct_fit_3.neural_field.geometry_encoder_*`：全局几何编码器容量；
+- `direct_fit_3.neural_field.geometry_latent_dimensions`：弯曲状态隐向量维数；
+- `direct_fit_3.neural_field.geometry_pca_dimensions`：标准化全局几何的 PCA 直连维数；
+- `direct_fit_3.neural_field.decoder_*`：三个位置—全局/局部几何标量 decoder 的容量；
+- `direct_fit_3.neural_field.steps/batch_size/frame_batch_size/learning_rate`：训练预算；
+- `direct_fit_3.neural_field.geometry_difference_*`：PCA 几何近邻数量、共同坐标采样数和
   RGB 差分监督权重；
-- `direct_fit.neural_field.validation_*`：固定验证帧/点数和校验间隔；
-- `direct_fit.neural_field.early_stopping_*`：早停耐心、最小步数和最小改善量；
-- `direct_fit.session_correction_max_deviation`：加性低频会话修正系数范围；
+- `direct_fit_3.neural_field.validation_*`：固定验证帧/点数和校验间隔；
+- `direct_fit_3.neural_field.early_stopping_*`：早停耐心、最小步数和最小改善量；
+- `direct_fit_3.session_correction_max_deviation`：加性低频会话修正系数范围；
 - `integration_nodes`：每条灯带弧长积分节点数；
 - `distance_epsilon_mm`：直接光核软化长度；
 - `delta_*`：灯带切平面内向和法向偏移；
@@ -1860,8 +1972,8 @@ Open3D 实时窗口关闭灯光，以线性 Turbo 色表显示有符号 $d$；�
 
 ### 27.4 法向与局部重建
 
-- `normal_calibration.output_files`：按背景方法隔离保存 LUT；
-- `local_reconstruction.calibration_files`：按当前背景方法选择 LUT；
+- `normal_calibration.output`：当前配置对应的 LUT 输出；
+- `local_reconstruction.calibration_file`：当前配置对应的实时 LUT；
 - `sphere_radius_mm`：坡度真值的球半径；
 - `detection.*`：MAD 阈值、连通域、圆 RANSAC 和几何验收；
 - `minimum_samples_per_node`：LUT 原始节点最小样本数；
@@ -1873,13 +1985,14 @@ Open3D 实时窗口关闭灯光，以线性 Turbo 色表显示有符号 $d$；�
 - `spectral_poisson_initialization_iterations`：频域初值固定点轮数；
 - `linear_solver`：实时矩阵自由 `lsmr` 或 `spectral_pcg`；
 - `realtime_solver_max_iterations`：实时精修预算；
-- `lsmr_atol`, `lsmr_btol`：迭代停止阈值。
+- `realtime_solver_tolerance`：只用于实时热启动求解的停止阈值；
+- `lsmr_atol`, `lsmr_btol`：离线迭代停止阈值。
 
 当前仓库配置快照的关键选择是：
 
 - 三网格 $120\times52$、$120\times52$、$400\times202$；
-- `background.method: physical_residual`（切为 `direct_fit` 即启用纯拟合）；
-- $K=20$ 个 raw M；
+- 主配置为 `background.method: direct_fit_3`；物理覆盖配置为
+  `background.method: physical_residual` 且保留 $K=20$ 个 raw M；
 - `residual_method: uniform_huber`；
 - `spectral_poisson_initialization_iterations: 2`；
 - `linear_solver: spectral_pcg`。
@@ -1965,7 +2078,7 @@ $$
 }.
 $$
 
-在 `direct_fit` 中没有 $\mathbf P$、gain/bias 或物理残差场，而是
+在 `direct_fit_3` 中没有 $\mathbf P$、gain/bias 或物理残差场，而是
 
 $$
 \widehat{\mathbf F}(p)

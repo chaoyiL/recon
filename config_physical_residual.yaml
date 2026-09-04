@@ -1,0 +1,80 @@
+# physical_residual 专用覆盖配置。
+# 相机、分割、整体/局部重建及公共残差参数继承主 config.yaml；本文件只保存
+# 物理光场链路独有的模型、灯带、积分/扩散和离线 B/M 参数。
+extends: config.yaml
+
+normal_calibration:
+  output: ~/recon/assets/normal_calibration/normal_lut.npz
+
+local_reconstruction:
+  calibration_file: ~/recon/assets/normal_calibration/normal_lut.npz
+
+lightfield:
+  background:
+    method: physical_residual
+  model_file: ~/recon/assets/lightfield_model.yaml
+
+  # 每个颜色可配置一条边或边列表；同色不同边是参数独立的实体灯带。
+  # 参数顺序固定为 R 列表、G 列表、B 列表。
+  light_source_layout:
+    R: [right]
+    G: [left]
+    B: [bottom, top]
+  integration_nodes: 48
+  distance_epsilon_mm: 0.05
+  diffusion_cg_tolerance: 0.0001
+  diffusion_cg_max_iterations: 30
+  gpu_chunk_size: 65536
+
+  calibration:
+    video_frame_step: 1
+    # 物理模型 Adam 的 GPU batch 和确定性洗牌种子。
+    physical_batch_size: 40
+    physical_seed: 0
+    spline_coefficients: 6
+
+    # 每条灯带两个几何自由度：[局部 x, 曲面法向]。
+    delta_initial_mm: [[0.0, 2.0], [0.0, 2.0], [0.0, 2.0]]
+    delta_bounds_mm:
+      - [[-8.0, 8.0], [0.0, 8.0]]
+      - [[-8.0, 8.0], [0.0, 8.0]]
+      - [[-8.0, 8.0], [0.0, 8.0]]
+    scatter_ratio_initial: [0.10, 0.10, 0.10]
+    scatter_ratio_bounds: [[0.0, 0.40], [0.0, 0.40], [0.0, 0.40]]
+    scatter_length_initial_mm: [3.0, 3.0, 3.0]
+    scatter_length_bounds_mm: [[1.0, 10.0], [1.0, 10.0], [1.0, 10.0]]
+    mixing_matrix_initial:
+      - [0.95, 0.025, 0.025]
+      - [0.025, 0.95, 0.025]
+      - [0.025, 0.025, 0.95]
+    mixing_max_offdiagonal_sum: 0.20
+
+    huber_delta: 0.03
+    lambda_beta: 0.001
+    lambda_delta: 0.001
+    lambda_scatter_ratio: 0.01
+    lambda_scatter_length: 0.0001
+    lambda_mixing_matrix: 0.05
+    learning_rate: 0.005
+    steps: 1500
+
+    # 冻结物理模型后学习长期 B 和由整体曲率解释的平滑 M。
+    residual_m_count: 20
+    residual_curvature_feature_count: 96
+    residual_curvature_curve_coefficients: 12
+    lambda_residual_curvature_smooth: 0.01
+    lambda_residual_curvature_regression: 0.01
+    residual_gpu_sample_batch_size: 8
+    residual_gpu_pixel_chunk_size: 128
+    residual_gpu_scale_sample_pixels: 512
+    residual_erode_pixels: 6
+    residual_b_max_field_deviation: 0.5
+    residual_bsession_max_field_deviation: 0.55
+    residual_m_max_field_deviation: 0.15
+
+  runtime:
+    display:
+      physical_render: false
+      physical_plus_residual: false
+    # 物理路径逐帧 B/M 分数拟合使用的规则像素步长。
+    residual_fit_pixel_stride: 4

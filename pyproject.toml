@@ -1,18 +1,60 @@
 [project]
 name = "recon"
 version = "0.1.0"
-description = "SAM2-assisted camera edge segmentation and 3D surface reconstruction"
+description = "SAM2/PP-LiteSeg camera edge segmentation and 3D surface reconstruction"
 requires-python = ">=3.10"
 dependencies = [
+    "filelock",
     "jax[cuda12]>=0.4.30",
     "open3d>=0.18.0",
     "opencv-python>=4.8.0",
+    "paddlepaddle-gpu==3.3.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "paddleseg; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "pillow>=12.3.0",
+    "prettytable",
     "pyyaml>=6.0.3",
+    "scikit-image",
+    "scikit-learn",
     "scipy>=1.15.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
+    "tqdm",
     "transformers>=5.14.1",
+    "visualdl>=2.2.0",
+]
+
+[tool.uv]
+# PaddleSeg 2.10 still declares opencv-python<=4.6.0, which has no compatible
+# Python 3.12 wheel.  The training/inference code is verified with OpenCV 4.8+.
+override-dependencies = [
+    "opencv-python>=4.8.0",
+]
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu130" }
+paddleseg = { git = "https://github.com/PaddlePaddle/PaddleSeg.git", rev = "3c4db66de1d9d59d0628ed87590b6308a2f4aa2a" }
+
+[[tool.uv.index]]
+name = "paddle-cu130"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+explicit = true
+
+# Paddle and the current Torch build pin different minor releases of the
+# same CUDA 13 libraries.  Torch already provides the complete CUDA runtime;
+# keep Paddle's Python requirements while sharing that runtime.
+[[tool.uv.dependency-metadata]]
+name = "paddlepaddle-gpu"
+version = "3.3.1"
+requires-dist = [
+    "httpx",
+    "networkx",
+    "numpy>=1.21",
+    "opt-einsum==3.3.0",
+    "pillow",
+    "protobuf>=3.20.2",
+    "safetensors>=0.6.0",
+    "setuptools; python_version >= '3.12'",
+    "typing-extensions",
 ]
 
 [build-system]
@@ -30,6 +72,7 @@ py-modules = [
     "manual_norm_regions",
     "recon",
     "render_lightfield",
+    "sam2_preview",
 ]
 
 [project.scripts]
@@ -40,3 +83,4 @@ calibrate-lightfield = "calibrate_lightfield:main"
 calibrate-norm = "calibrate_norm:main"
 recon-local = "recon:local_main"
 render-lightfield = "render_lightfield:main"
+sam2-preview = "sam2_preview:main"

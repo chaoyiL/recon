@@ -93,18 +93,18 @@ class LocalReconstructionTest(unittest.TestCase):
             config.write_text(
                 "lightfield:\n"
                 "  background:\n"
-                "    method: direct_fit\n"
+                "    method: direct_fit_3\n"
                 "    model_files:\n"
                 "      physical_residual: models/physical.yaml\n"
-                "      direct_fit: models/direct.yaml\n"
+                "      direct_fit_3: models/direct_3.yaml\n"
                 "local_reconstruction:\n"
                 "  calibration_files:\n"
                 "    physical_residual: lut/physical.npz\n"
-                "    direct_fit: lut/direct.npz\n",
+                "    direct_fit_3: lut/direct_3.npz\n",
                 encoding="utf-8")
             settings=load_local_reconstruction_settings(
                 config,input_override="captures/frame.npz")
-        self.assertEqual(settings.calibration_file,root/"lut/direct.npz")
+        self.assertEqual(settings.calibration_file,root/"lut/direct_3.npz")
 
     def test_standalone_missing_input_points_to_realtime_entry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,10 +257,10 @@ class LocalReconstructionTest(unittest.TestCase):
             model.save(
                 path,sphere_radius_mm=np.asarray(5.,np.float32),
                 residual_method=np.asarray("uniform"),
-                background_method=np.asarray("direct_fit"),
+                background_method=np.asarray("direct_fit_3"),
                 background_model_sha256=np.asarray("a"*64))
             with np.load(path,allow_pickle=False) as data:
-                self.assertEqual(int(data["format_version"]),3)
+                self.assertEqual(int(data["format_version"]),4)
                 self.assertEqual(str(data["color_residual_mode"]),"signed")
                 legacy={key:np.asarray(data[key]) for key in data.files
                         if key!="color_residual_mode"}
@@ -273,7 +273,7 @@ class LocalReconstructionTest(unittest.TestCase):
         np.testing.assert_array_equal(loaded.slopes,model.slopes)
         np.testing.assert_array_equal(loaded.variances,model.variances)
         self.assertEqual(loaded.residual_method,"uniform")
-        self.assertEqual(loaded.background_method,"direct_fit")
+        self.assertEqual(loaded.background_method,"direct_fit_3")
         self.assertEqual(loaded.background_model_sha256,"a"*64)
 
     def test_normal_calibration_accepts_direct_fit_3_metadata(self):

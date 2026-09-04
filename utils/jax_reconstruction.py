@@ -10,9 +10,22 @@ import numpy as np
 
 from .process import (_aggregate_edge_by_v, _resample_polyline, _undistort_pixels,
                       split_edge_segments)
+from .material_surface import MaterialSurfaceState
 
 Array = jax.Array
-SURFACE_RECONSTRUCTION_PIPELINE_VERSION = "jax_surface_from_masks_v1"
+SURFACE_RECONSTRUCTION_PIPELINE_VERSION = (
+    "jax_material_surface_v15_no_endpoint_inference")
+
+# 顺序同时是离线标定准入诊断数组的稳定字段顺序。
+MATERIAL_UPDATE_FAILURE_NAMES = (
+    "reconstruction_invalid",
+    "nonfinite",
+    "nonpositive_depth",
+    "candidate_invalid",
+    "rms_too_high",
+    "confidence_too_low",
+    "uv_triangle_too_large",
+)
 
 
 def _solve_block_pentadiagonal_jax(
@@ -187,57 +200,11 @@ def prepare_edge_curves(
     return np.stack(left_curves),np.stack(right_curves)
 
 
-def _morphology_jax(masks: Array,kernel_size: int,operation: str) -> Array:
-    """对 KxHxW mask 执行固定窗口二值形态学。"""
-    if kernel_size<=1:
-        return masks.astype(jnp.bool_)
-    window=(1,kernel_size,kernel_size)
-    strides=(1,1,1)
-    values=masks.astype(jnp.uint8)
-    if operation=="dilate":
-        reduced=jax.lax.reduce_window(
-            values,jnp.uint8(0),jax.lax.max,window,strides,"SAME")
-    elif operation=="erode":
-        reduced=jax.lax.reduce_window(
-            values,jnp.uint8(1),jax.lax.min,window,strides,"SAME")
-    else:
-        raise ValueError(f"未知形态学操作: {operation}")
-    return reduced>0
-
-
-def refine_surface_masks_jax(
-    masks: Array,
-    *,
-    close_kernel: int = 0,
-    open_kernel: int = 0,
-    blur_kernel: int = 0,
-) -> Array:
-    """在 GPU 上完成闭运算、开运算和高斯平滑阈值化。"""
-    close_kernel=(close_kernel if close_kernel%2 else close_kernel+1)
-    open_kernel=(open_kernel if open_kernel%2 else open_kernel+1)
-    blur_kernel=(blur_kernel if blur_kernel%2 else blur_kernel+1)
+def refine_surface_masks_jax(masks: Array) -> Array:
+    """校验并上传已经在 CPU 完成最大外轮廓保留和填洞的 mask。"""
     refined=jnp.asarray(masks,jnp.bool_)
     if refined.ndim!=3:
         raise ValueError("masks 必须是 KxHxW")
-    if close_kernel>1:
-        refined=_morphology_jax(refined,close_kernel,"dilate")
-        refined=_morphology_jax(refined,close_kernel,"erode")
-    if open_kernel>1:
-        refined=_morphology_jax(refined,open_kernel,"erode")
-        refined=_morphology_jax(refined,open_kernel,"dilate")
-    if blur_kernel>1:
-        radius=(blur_kernel-1)/2
-        sigma=.3*(radius-1)+.8
-        coordinate=jnp.arange(blur_kernel,dtype=jnp.float32)-radius
-        gaussian=jnp.exp(-.5*(coordinate/sigma)**2)
-        gaussian=gaussian/jnp.sum(gaussian)
-        kernel=(gaussian[:,None,None,None]*
-                gaussian[None,:,None,None])
-        blurred=jax.lax.conv_general_dilated(
-            refined[...,None].astype(jnp.float32),kernel,
-            window_strides=(1,1),padding="SAME",
-            dimension_numbers=("NHWC","HWIO","NHWC"))[...,0]
-        refined=blurred>.5
     return refined
 
 
@@ -308,24 +275,33 @@ def prepare_edge_curves_from_masks_jax(
     camera_matrix: Array,
     distortion: Array,
     sample_count: int,
-    center_band_d: float,
     *,
-    close_kernel: int = 0,
-    open_kernel: int = 0,
-    blur_kernel: int = 0,
-    min_v: int = 5,
+    min_v: int = 0,
+    side_edge_exclusion_ratio: float = 0.,
 ) -> tuple[Array,Array,Array,Array]:
-    """从设备端 mask 生成固定形状的无畸变左右边缘曲线。"""
-    refined=refine_surface_masks_jax(
-        masks,close_kernel=close_kernel,open_kernel=open_kernel,
-        blur_kernel=blur_kernel)
+    """逐行取 mask 左右包络，生成固定形状的无畸变侧边曲线。
+
+    每行只保留最左和最右像素，因此横向封口边的内部点不会进入曲线。
+    ``side_edge_exclusion_ratio`` 按每个 mask 的有效高度从上下端各排除相同比例；
+    返回的 refined mask 保持完整，排除只影响假定为 x=±W/2 的侧边样本。
+    """
+    ratio=float(side_edge_exclusion_ratio)
+    if not 0. <= ratio < .5:
+        raise ValueError("side_edge_exclusion_ratio 必须位于 [0,0.5)")
+    refined=refine_surface_masks_jax(masks)
     _,height,width=refined.shape
     columns=jnp.arange(width,dtype=jnp.int32)[None,None,:]
     left_index=jnp.min(jnp.where(refined,columns,width),axis=2)
     right_index=jnp.max(jnp.where(refined,columns,-1),axis=2)
     row_index=jnp.arange(height,dtype=jnp.int32)[None,:]
-    valid_rows=((left_index<right_index)&(row_index>=min_v)&
-                ((right_index-left_index)>2*center_band_d))
+    envelope_rows=left_index<right_index
+    first_row=jnp.min(jnp.where(envelope_rows,row_index,height),axis=1)
+    last_row=jnp.max(jnp.where(envelope_rows,row_index,-1),axis=1)
+    row_span=jnp.maximum(last_row-first_row,0)
+    lower=first_row+ratio*row_span
+    upper=last_row-ratio*row_span
+    valid_rows=(envelope_rows&(row_index>=min_v)
+                &(row_index>=lower[:,None])&(row_index<=upper[:,None]))
     left=_smooth_row_boundaries_jax(
         left_index.astype(jnp.float32),valid_rows)
     right=_smooth_row_boundaries_jax(
@@ -641,6 +617,32 @@ def resample_surface_batch_jax(
     )
 
 
+def resample_material_surface_jax(
+    state: MaterialSurfaceState,
+    *,
+    target_rows: int,
+    target_columns: int,
+) -> tuple[Array,Array,Array,Array,Array]:
+    """在固定材料域重采样完整状态，并传播保守可见性。"""
+    xyz=_resize_endpoint_aligned_jax(
+        state.xyz[None],target_rows,target_columns)[0]
+    uv=_resize_endpoint_aligned_jax(
+        state.uv[None],target_rows,target_columns)[0]
+    depth=_resize_endpoint_aligned_jax(
+        state.camera_depth[None,...,None],
+        target_rows,target_columns)[0,...,0]
+    visibility=_resize_endpoint_aligned_jax(
+        state.visible[None,...,None].astype(jnp.float32),
+        target_rows,target_columns)[0,...,0]
+    st_s,st_t=jnp.meshgrid(
+        jnp.linspace(0.,1.,target_rows,dtype=xyz.dtype),
+        jnp.linspace(0.,1.,target_columns,dtype=xyz.dtype),indexing="ij")
+    st=jnp.stack([st_s,st_t],axis=-1)
+    # 只有双线性邻域全部可见才允许颜色或局部观测。
+    visible=visibility>=1-1e-6
+    return xyz,uv,st,depth,visible
+
+
 def _distort_pixels_jax(points: Array,camera_matrix: Array,distortion: Array) -> Array:
     """OpenCV 五参数径向/切向畸变模型。"""
     x=(points[...,0]-camera_matrix[0,2])/camera_matrix[0,0]
@@ -692,6 +694,412 @@ def build_surface_grid_jax(h: Array,z: Array,left_uv: Array,right_uv: Array,
     return result
 
 
+def material_curve_from_angles_jax(
+    origin_yz: Array,
+    angles_rad: Array,
+    segment_lengths_mm: Array,
+) -> Array:
+    """按固定静止段长从原点和切向角精确重建材料中心线。"""
+    steps=segment_lengths_mm[:,None]*jnp.stack(
+        [jnp.cos(angles_rad),jnp.sin(angles_rad)],axis=-1)
+    return jnp.concatenate([
+        origin_yz[None],origin_yz[None]+jnp.cumsum(steps,axis=0)],axis=0)
+
+
+def _material_angles_from_curve_jax(curve_yz: Array) -> Array:
+    delta=jnp.diff(curve_yz,axis=0)
+    return jnp.arctan2(delta[:,1],delta[:,0])
+
+
+def _resample_material_observation_by_arclength_jax(
+    curve_yz: Array,
+    uv: Array,
+    output_count: int | None = None,
+) -> tuple[Array,Array,Array,Array]:
+    """按观测中心线弧长同步重采样 YZ 和左右/内部 UV。"""
+    segment=jnp.linalg.norm(jnp.diff(curve_yz,axis=0),axis=1)
+    raw_total=jnp.sum(segment)
+    epsilon=jnp.asarray(1e-6,curve_yz.dtype)
+    safe_segment=jnp.maximum(segment,epsilon)
+    source=jnp.concatenate([
+        jnp.zeros((1,),curve_yz.dtype),jnp.cumsum(safe_segment)])
+    count=curve_yz.shape[0] if output_count is None else int(output_count)
+    targets=jnp.linspace(0.,source[-1],count,dtype=curve_yz.dtype)
+
+    def interpolate(values):
+        flat=values.reshape(values.shape[0],-1).T
+        sampled=jax.vmap(lambda channel:jnp.interp(
+            targets,source,channel))(flat).T
+        return sampled.reshape((count,*values.shape[1:]))
+
+    return interpolate(curve_yz),interpolate(uv),targets,raw_total
+
+
+def _interpolate_material_curve_jax(
+    curve_yz: Array,
+    material_coordinate: Array,
+    targets: Array,
+) -> Array:
+    return jnp.stack([
+        jnp.interp(targets,material_coordinate,curve_yz[:,axis])
+        for axis in range(2)
+    ],axis=-1)
+
+
+def _interpolate_material_uv_jax(
+    uv: Array,
+    material_coordinate: Array,
+    targets: Array,
+) -> Array:
+    flat=uv.reshape(uv.shape[0],-1).T
+    sampled=jax.vmap(lambda channel:jnp.interp(
+        targets,material_coordinate,channel))(flat).T
+    return sampled.reshape((targets.shape[0],*uv.shape[1:]))
+
+
+def _material_grid_from_curve_jax(
+    curve_yz: Array,
+    angles_rad: Array,
+    x_coordinates_mm: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    rotation: Array,
+    tx: float,
+    row_visible: Array,
+    observed_left_uv: Array,
+    observed_right_uv: Array,
+    previous_left_error: Array,
+    previous_right_error: Array,
+    *,
+    boundary_smooth_lambda: float,
+    boundary_huber_delta: float,
+    reprojection_rms: Array,
+    state_valid: Array,
+    matching_confidence: Array,
+) -> MaterialSurfaceState:
+    """从固定材料中心线生成完整 XYZ/UV，并只在可见行更新边界误差。"""
+    rows=curve_yz.shape[0]; columns=x_coordinates_mm.shape[0]
+    xyz=jnp.stack([
+        jnp.broadcast_to(x_coordinates_mm[None],(rows,columns)),
+        jnp.broadcast_to(curve_yz[:,0,None],(rows,columns)),
+        jnp.broadcast_to(curve_yz[:,1,None],(rows,columns)),
+    ],axis=-1)
+    projected,depth=_project_world_points_jax(
+        xyz.reshape(-1,3),camera_matrix,rotation,tx)
+    projected=projected.reshape(rows,columns,2)
+    depth=depth.reshape(rows,columns)
+    projected_distorted=_distort_pixels_jax(
+        projected,camera_matrix,distortion)
+    measured_left=observed_left_uv-projected_distorted[:,0]
+    measured_right=observed_right_uv-projected_distorted[:,-1]
+    left_raw=jnp.where(
+        row_visible[:,None],measured_left,previous_left_error)
+    right_raw=jnp.where(
+        row_visible[:,None],measured_right,previous_right_error)
+    left_error=_smooth_boundary_error_jax(
+        left_raw,boundary_smooth_lambda,boundary_huber_delta)
+    right_error=_smooth_boundary_error_jax(
+        right_raw,boundary_smooth_lambda,boundary_huber_delta)
+    alpha=jnp.linspace(0.,1.,columns,dtype=xyz.dtype)
+    correction=(1-alpha)[None,:,None]*left_error[:,None,:] \
+        +alpha[None,:,None]*right_error[:,None,:]
+    uv=projected_distorted+correction
+    visible=jnp.broadcast_to(row_visible[:,None],(rows,columns))
+    finite=(jnp.all(jnp.isfinite(xyz))&jnp.all(jnp.isfinite(uv))&
+            jnp.all(depth>0))
+    valid=state_valid&finite
+    return MaterialSurfaceState(
+        curve_yz=curve_yz,angles_rad=angles_rad,xyz=xyz,uv=uv,
+        camera_depth=depth,visible=visible,observable_rows=row_visible,
+        left_uv_error=left_error,right_uv_error=right_error,valid=valid,
+        tracking_accepted=valid,
+        reprojection_rms_px=reprojection_rms,
+        visible_fraction=jnp.mean(row_visible.astype(jnp.float32)),
+        matching_confidence=matching_confidence)
+
+
+def reference_material_surface_state_jax(
+    reference_curve_yz: Array,
+    reference_angles_rad: Array,
+    x_coordinates_mm: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    rotation: Array,
+    tx: float,
+) -> MaterialSurfaceState:
+    """建立尚未完成会话对齐的固定形状占位状态。"""
+    rows=reference_curve_yz.shape[0]
+    projected_left,_=_project_world_points_jax(
+        jnp.stack([
+            jnp.full((rows,),x_coordinates_mm[0]),
+            reference_curve_yz[:,0],reference_curve_yz[:,1]],axis=-1),
+        camera_matrix,rotation,tx)
+    projected_right,_=_project_world_points_jax(
+        jnp.stack([
+            jnp.full((rows,),x_coordinates_mm[-1]),
+            reference_curve_yz[:,0],reference_curve_yz[:,1]],axis=-1),
+        camera_matrix,rotation,tx)
+    return _material_grid_from_curve_jax(
+        reference_curve_yz,reference_angles_rad,x_coordinates_mm,
+        camera_matrix,distortion,rotation,tx,jnp.zeros((rows,),jnp.bool_),
+        _distort_pixels_jax(projected_left,camera_matrix,distortion),
+        _distort_pixels_jax(projected_right,camera_matrix,distortion),
+        jnp.zeros((rows,2),reference_curve_yz.dtype),
+        jnp.zeros((rows,2),reference_curve_yz.dtype),
+        boundary_smooth_lambda=0.,boundary_huber_delta=1.,
+        reprojection_rms=jnp.asarray(jnp.inf,reference_curve_yz.dtype),
+        state_valid=jnp.asarray(False),
+        matching_confidence=jnp.asarray(0.,reference_curve_yz.dtype))
+
+
+def _initialize_material_surface_candidate_jax(
+    observed_xyz: Array,
+    observed_uv: Array,
+    observed_rms: Array,
+    segment_lengths_mm: Array,
+    x_coordinates_mm: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    rotation: Array,
+    tx: float,
+    *,
+    boundary_smooth_lambda: float,
+    boundary_huber_delta: float,
+) -> MaterialSurfaceState:
+    """把当前规则轮廓的方向场直接归一到固定材料段长。"""
+    raw_observed_curve=observed_xyz[:,0,1:3]
+    observed_curve,observed_uv,_,_=(
+        _resample_material_observation_by_arclength_jax(
+            raw_observed_curve,observed_uv))
+    raw_angles=_material_angles_from_curve_jax(observed_curve)
+    zero_shape=material_curve_from_angles_jax(
+        jnp.zeros((2,),observed_curve.dtype),raw_angles,segment_lengths_mm)
+    origin=jnp.mean(observed_curve-zero_shape,axis=0)
+    curve=material_curve_from_angles_jax(
+        origin,raw_angles,segment_lengths_mm)
+    row_visible=jnp.ones((observed_curve.shape[0],),jnp.bool_)
+    return _material_grid_from_curve_jax(
+        curve,raw_angles,x_coordinates_mm,camera_matrix,distortion,rotation,tx,
+        row_visible,observed_uv[:,0],observed_uv[:,-1],
+        jnp.zeros((curve.shape[0],2),curve.dtype),
+        jnp.zeros((curve.shape[0],2),curve.dtype),
+        boundary_smooth_lambda=boundary_smooth_lambda,
+        boundary_huber_delta=boundary_huber_delta,
+        reprojection_rms=observed_rms,state_valid=jnp.asarray(True),
+        matching_confidence=jnp.asarray(1.,observed_curve.dtype))
+
+
+def initialize_material_surface_state_jax(
+    observed_xyz: Array,
+    observed_uv: Array,
+    observed_rms: Array,
+    segment_lengths_mm: Array,
+    x_coordinates_mm: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    rotation: Array,
+    tx: float,
+    *,
+    initial_calibration_maximum_rms_px: float,
+    boundary_smooth_lambda: float,
+    boundary_huber_delta: float,
+) -> MaterialSurfaceState:
+    """兼容入口：把当前规则轮廓归一到固定材料段长。"""
+    del initial_calibration_maximum_rms_px
+    return _initialize_material_surface_candidate_jax(
+        observed_xyz,observed_uv,observed_rms,segment_lengths_mm,
+        x_coordinates_mm,camera_matrix,distortion,rotation,tx,
+        boundary_smooth_lambda=boundary_smooth_lambda,
+        boundary_huber_delta=boundary_huber_delta)
+
+
+def update_material_surface_state_jax(
+    previous: MaterialSurfaceState,
+    observed_xyz: Array,
+    observed_uv: Array,
+    observed_rms: Array,
+    observation_valid: Array,
+    segment_lengths_mm: Array,
+    x_coordinates_mm: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    rotation: Array,
+    tx: float,
+    *,
+    match_confidence_scale_mm: float,
+    rms_confidence_scale_px: float,
+    confidence_floor: float,
+    bend_direction: str,
+    boundary_smooth_lambda: float,
+    boundary_huber_delta: float,
+) -> MaterialSurfaceState:
+    """生成在线候选状态；结构有效性由外层原子提交逻辑处理。"""
+    raw_observed_curve=observed_xyz[:,0,1:3]
+    raw_observed_uv=observed_uv
+    row_finite=(
+        jnp.all(jnp.isfinite(raw_observed_curve),axis=1)
+        &jnp.all(jnp.isfinite(raw_observed_uv[:,0]),axis=1)
+        &jnp.all(jnp.isfinite(raw_observed_uv[:,-1]),axis=1))
+    finite_curve=jnp.where(
+        row_finite[:,None],raw_observed_curve,previous.curve_yz)
+    finite_uv=jnp.where(
+        row_finite[:,None,None],raw_observed_uv,previous.uv)
+    observed_curve,observed_uv,_,_=(
+        _resample_material_observation_by_arclength_jax(
+            finite_curve,finite_uv))
+    observed_segment=jnp.linalg.norm(
+        jnp.diff(observed_curve,axis=0),axis=1)
+    observed_coordinate=jnp.concatenate([
+        jnp.zeros((1,),observed_curve.dtype),
+        jnp.cumsum(observed_segment)])
+    observed_length=observed_coordinate[-1]
+    template_coordinate=jnp.concatenate([
+        jnp.zeros((1,),observed_curve.dtype),
+        jnp.cumsum(segment_lengths_mm)])
+    template_length=template_coordinate[-1]
+    aligned_coordinate=(observed_coordinate*template_length
+                        /jnp.maximum(observed_length,1e-6))
+    previous_at_observation=_interpolate_material_curve_jax(
+        previous.curve_yz,template_coordinate,aligned_coordinate)
+    matching_distance=jnp.sqrt(jnp.mean(jnp.sum(
+        (previous_at_observation-observed_curve)**2,axis=-1)))
+    target_curve=_interpolate_material_curve_jax(
+        observed_curve,aligned_coordinate,template_coordinate)
+    aligned_uv=_interpolate_material_uv_jax(
+        observed_uv,aligned_coordinate,template_coordinate)
+    observed_left=aligned_uv[:,0]
+    observed_right=aligned_uv[:,-1]
+    row_visible=jnp.ones_like(template_coordinate,dtype=jnp.bool_)
+    target_angles=_material_angles_from_curve_jax(target_curve)
+    angles=target_angles
+    if bend_direction!="none":
+        sign=1. if bend_direction=="increasing" else -1.
+        angles=sign*_weighted_isotonic_nondecreasing_jax(
+            sign*angles,jnp.asarray(segment_lengths_mm))
+    zero_shape=material_curve_from_angles_jax(
+        jnp.zeros((2,),observed_curve.dtype),angles,segment_lengths_mm)
+    origin=jnp.mean(target_curve-zero_shape,axis=0)
+    curve=material_curve_from_angles_jax(origin,angles,segment_lengths_mm)
+    visible_fraction=jnp.mean(row_visible.astype(observed_curve.dtype))
+    # 固定 55 mm 模板会有意吸收当前轮廓测长误差；其未修正投影与观测边界的
+    # 差值不是重建误差，不能再用于准入。与初始化一致，质量由共享曲线求解的
+    # 左右边重投影 RMS 衡量；最终 UV 仍由下方边界修正贴合实际 mask。
+    calibration_rms=observed_rms
+    distance_confidence=jnp.exp(
+        -.5*(matching_distance/match_confidence_scale_mm)**2)
+    rms_confidence=jnp.exp(
+        -.5*(calibration_rms/rms_confidence_scale_px)**2)
+    finite_fraction=jnp.mean(row_finite.astype(observed_curve.dtype))
+    confidence=(
+        visible_fraction*distance_confidence*rms_confidence*finite_fraction)
+    catastrophic=(
+        ~observation_valid|~jnp.isfinite(calibration_rms)
+        |~jnp.isfinite(matching_distance)|(finite_fraction<1))
+    confidence=jnp.where(catastrophic,confidence_floor,confidence)
+    confidence=jnp.clip(confidence,confidence_floor,1.)
+    return _material_grid_from_curve_jax(
+        curve,angles,x_coordinates_mm,camera_matrix,distortion,rotation,tx,
+        row_visible,observed_left,observed_right,
+        previous.left_uv_error,previous.right_uv_error,
+        boundary_smooth_lambda=boundary_smooth_lambda,
+        boundary_huber_delta=boundary_huber_delta,
+        reprojection_rms=calibration_rms,state_valid=previous.valid,
+        matching_confidence=confidence)
+
+
+def _uv_triangles_fit_raster_capacity_jax(
+    uv: Array,
+    maximum_width_px: int,
+    maximum_height_px: int,
+) -> Array:
+    """在光栅化前检查每个网格三角形的整数像素包围盒。"""
+    top_left=uv[:-1,:-1]
+    bottom_left=uv[1:,:-1]
+    bottom_right=uv[1:,1:]
+    top_right=uv[:-1,1:]
+    triangles=jnp.stack([
+        jnp.stack([top_left,bottom_left,bottom_right],axis=-2),
+        jnp.stack([top_left,bottom_right,top_right],axis=-2),
+    ],axis=0)
+    minimum=jnp.floor(jnp.min(triangles,axis=-2))
+    maximum=jnp.ceil(jnp.max(triangles,axis=-2))
+    size=maximum-minimum+1.
+    return (
+        jnp.all(jnp.isfinite(size))
+        &jnp.all(size[...,0]<=maximum_width_px)
+        &jnp.all(size[...,1]<=maximum_height_px))
+
+
+def _select_material_surface_candidate_jax(
+    previous_state: MaterialSurfaceState,
+    candidate: MaterialSurfaceState,
+    *,
+    observation_ok: Array,
+    maximum_rms_px: float,
+    minimum_confidence: float,
+    maximum_uv_triangle_width_px: int,
+    maximum_uv_triangle_height_px: int,
+) -> tuple[MaterialSurfaceState,Array,Array,Array]:
+    """分别判定追踪提交与标定准入；质量差不再回滚安全几何。"""
+    observation_valid=jnp.asarray(observation_ok,jnp.bool_)
+    finite=(
+        jnp.all(jnp.isfinite(candidate.curve_yz))
+        &jnp.all(jnp.isfinite(candidate.angles_rad))
+        &jnp.all(jnp.isfinite(candidate.xyz))
+        &jnp.all(jnp.isfinite(candidate.uv))
+        &jnp.all(jnp.isfinite(candidate.camera_depth))
+        &jnp.all(jnp.isfinite(candidate.left_uv_error))
+        &jnp.all(jnp.isfinite(candidate.right_uv_error))
+        &jnp.isfinite(candidate.reprojection_rms_px)
+        &jnp.isfinite(candidate.visible_fraction)
+        &jnp.isfinite(candidate.matching_confidence))
+    positive_depth=jnp.all(candidate.camera_depth>0)
+    rms_ok=(jnp.isfinite(candidate.reprojection_rms_px)
+            &(candidate.reprojection_rms_px<=maximum_rms_px))
+    confidence_ok=(jnp.isfinite(candidate.matching_confidence)
+                   &(candidate.matching_confidence>=minimum_confidence))
+    uv_capacity_ok=_uv_triangles_fit_raster_capacity_jax(
+        candidate.uv,maximum_uv_triangle_width_px,
+        maximum_uv_triangle_height_px)
+    candidate_valid=jnp.asarray(candidate.valid,jnp.bool_)
+    failure_flags=jnp.stack([
+        ~observation_valid,
+        ~finite,
+        ~positive_depth,
+        ~candidate_valid,
+        ~rms_ok,
+        ~confidence_ok,
+        ~uv_capacity_ok,
+    ])
+    # 只有无法安全成为下一状态的错误才回滚追踪；RMS/confidence
+    # 只控制本帧是否允许写入标定集。
+    tracking_failure_flags=jnp.stack([
+        ~observation_valid,
+        ~finite,
+        ~positive_depth,
+        ~candidate_valid,
+        ~uv_capacity_ok,
+    ])
+    tracking_accepted=~jnp.any(tracking_failure_flags)
+    calibration_accepted=tracking_accepted&rms_ok&confidence_ok
+    candidate_children,_=candidate.tree_flatten()
+    previous_children,_=previous_state.tree_flatten()
+    selected=[
+        jnp.where(tracking_accepted,value,old)
+        for value,old in zip(
+            candidate_children,previous_children,strict=True)
+    ]
+    # valid 描述最终返回的几何；tracking_accepted 描述追踪候选是否提交。
+    selected[9]=jnp.where(
+        tracking_accepted,candidate.valid,previous_state.valid)
+    selected[10]=tracking_accepted
+    # 结构性回滚时仍保留本次尝试的质量量，供失败诊断使用。
+    selected[11]=candidate.reprojection_rms_px
+    selected[13]=candidate.matching_confidence
+    return (MaterialSurfaceState(*selected),tracking_accepted,
+            calibration_accepted,failure_flags)
+
+
 def reconstruct_surface_batch_jax(left_curves: Array,right_dense_curves: Array,
                                   camera_matrix: Array,distortion: Array,rotation: Array,
                                   s1: float,s2: float,tx: float,n_fill: int,
@@ -735,15 +1143,12 @@ def reconstruct_surface_from_masks_jax(
     s2: float,
     tx: float,
     sample_count: int,
-    center_band_d: float,
     n_fill: int,
     boundary_smooth_lambda: float,
     boundary_huber_delta: float,
     curve_convexity: str = "none",
     *,
-    close_kernel: int = 0,
-    open_kernel: int = 0,
-    blur_kernel: int = 0,
+    side_edge_exclusion_ratio: float = 0.,
 ) -> tuple[Array,Array,Array,Array,Array,Array,Array]:
     """按实时路径从设备端 SAM mask 一次完成整体规则曲面重建。
 
@@ -752,12 +1157,149 @@ def reconstruct_surface_from_masks_jax(
     """
     refined,left_curves,right_dense_curves,edge_valid=(
         prepare_edge_curves_from_masks_jax(
-            raw_masks,camera_matrix,distortion,sample_count,center_band_d,
-            close_kernel=close_kernel,open_kernel=open_kernel,
-            blur_kernel=blur_kernel))
+            raw_masks,camera_matrix,distortion,sample_count,
+            side_edge_exclusion_ratio=side_edge_exclusion_ratio))
     xyz,uv,st,depth,rms,reconstruction_valid=reconstruct_surface_batch_jax(
         left_curves,right_dense_curves,camera_matrix,distortion,rotation,
         s1,s2,tx,n_fill,boundary_smooth_lambda,boundary_huber_delta,
         inverse_camera,curve_convexity)
     return (refined,xyz,uv,st,depth,rms,
             reconstruction_valid&edge_valid)
+
+
+def reconstruct_material_surface_with_diagnostics_from_masks_jax(
+    raw_masks: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    inverse_camera: Array,
+    rotation: Array,
+    s1: float,
+    s2: float,
+    tx: float,
+    sample_count: int,
+    n_fill: int,
+    boundary_smooth_lambda: float,
+    boundary_huber_delta: float,
+    previous_state: MaterialSurfaceState,
+    template_st: Array,
+    segment_lengths_mm: Array,
+    x_coordinates_mm: Array,
+    *,
+    initialized: Array,
+    initial_calibration_maximum_rms_px: float,
+    calibration_maximum_rms_px: float,
+    calibration_minimum_confidence: float,
+    match_confidence_scale_mm: float,
+    rms_confidence_scale_px: float,
+    confidence_floor: float,
+    bend_direction: str,
+    maximum_uv_triangle_width_px: int,
+    maximum_uv_triangle_height_px: int,
+    side_edge_exclusion_ratio: float = 0.,
+) -> tuple[
+    Array,MaterialSurfaceState,Array,Array,Array,Array,Array,Array,Array,Array
+]:
+    """GPU 材料重建入口，分别返回追踪提交和标定准入结果。"""
+    if raw_masks.shape[0]!=1:
+        raise ValueError("固定材料坐标当前只支持一个连续曲面 label")
+    refined,observed_xyz,observed_uv,_,_,observed_rms,observed_valid=(
+        reconstruct_surface_from_masks_jax(
+            raw_masks,camera_matrix,distortion,inverse_camera,rotation,
+            s1,s2,tx,sample_count,n_fill,
+            boundary_smooth_lambda,boundary_huber_delta,
+            curve_convexity="none",
+            side_edge_exclusion_ratio=side_edge_exclusion_ratio))
+    observed_xyz=observed_xyz.reshape(
+        sample_count,n_fill+2,3)
+    observed_uv=observed_uv.reshape(
+        sample_count,n_fill+2,2)
+    observation_ok=observed_valid[0]
+
+    def initialize(_):
+        state=_initialize_material_surface_candidate_jax(
+            observed_xyz,observed_uv,observed_rms[0],
+            segment_lengths_mm,x_coordinates_mm,camera_matrix,distortion,
+            rotation,tx,
+            boundary_smooth_lambda=boundary_smooth_lambda,
+            boundary_huber_delta=boundary_huber_delta)
+        return state,jnp.asarray(True)
+
+    def update(_):
+        state=update_material_surface_state_jax(
+            previous_state,observed_xyz,observed_uv,observed_rms[0],
+            observed_valid[0],
+            segment_lengths_mm,x_coordinates_mm,camera_matrix,distortion,
+            rotation,tx,
+            match_confidence_scale_mm=match_confidence_scale_mm,
+            rms_confidence_scale_px=rms_confidence_scale_px,
+            confidence_floor=confidence_floor,
+            bend_direction=bend_direction,
+            boundary_smooth_lambda=boundary_smooth_lambda,
+            boundary_huber_delta=boundary_huber_delta)
+        return state,jnp.asarray(True)
+
+    candidate,_=jax.lax.cond(
+        initialized,update,initialize,operand=None)
+    maximum_rms_px=jnp.where(
+        initialized,calibration_maximum_rms_px,
+        initial_calibration_maximum_rms_px)
+    (state,tracking_accepted,calibration_accepted,
+     failure_flags)=_select_material_surface_candidate_jax(
+        previous_state,candidate,
+        observation_ok=observation_ok,maximum_rms_px=maximum_rms_px,
+        minimum_confidence=calibration_minimum_confidence,
+        maximum_uv_triangle_width_px=maximum_uv_triangle_width_px,
+        maximum_uv_triangle_height_px=maximum_uv_triangle_height_px)
+    return (refined,state,template_st,observed_valid,tracking_accepted,
+            calibration_accepted,observed_xyz,observed_uv,observed_rms,
+            failure_flags)
+
+
+def reconstruct_material_surface_from_masks_jax(
+    raw_masks: Array,
+    camera_matrix: Array,
+    distortion: Array,
+    inverse_camera: Array,
+    rotation: Array,
+    s1: float,
+    s2: float,
+    tx: float,
+    sample_count: int,
+    n_fill: int,
+    boundary_smooth_lambda: float,
+    boundary_huber_delta: float,
+    previous_state: MaterialSurfaceState,
+    template_st: Array,
+    segment_lengths_mm: Array,
+    x_coordinates_mm: Array,
+    *,
+    initialized: Array,
+    initial_calibration_maximum_rms_px: float,
+    calibration_maximum_rms_px: float,
+    calibration_minimum_confidence: float,
+    match_confidence_scale_mm: float,
+    rms_confidence_scale_px: float,
+    confidence_floor: float,
+    bend_direction: str,
+    maximum_uv_triangle_width_px: int,
+    maximum_uv_triangle_height_px: int,
+    side_edge_exclusion_ratio: float = 0.,
+) -> tuple[Array,MaterialSurfaceState,Array,Array,Array]:
+    """实时入口：第五项是追踪提交结果。"""
+    result=reconstruct_material_surface_with_diagnostics_from_masks_jax(
+        raw_masks,camera_matrix,distortion,inverse_camera,rotation,s1,s2,tx,
+        sample_count,n_fill,boundary_smooth_lambda,
+        boundary_huber_delta,previous_state,template_st,segment_lengths_mm,
+        x_coordinates_mm,initialized=initialized,
+        initial_calibration_maximum_rms_px=
+            initial_calibration_maximum_rms_px,
+        calibration_maximum_rms_px=calibration_maximum_rms_px,
+        calibration_minimum_confidence=calibration_minimum_confidence,
+        match_confidence_scale_mm=match_confidence_scale_mm,
+        rms_confidence_scale_px=rms_confidence_scale_px,
+        confidence_floor=confidence_floor,
+        bend_direction=bend_direction,
+        maximum_uv_triangle_width_px=maximum_uv_triangle_width_px,
+        maximum_uv_triangle_height_px=maximum_uv_triangle_height_px,
+        side_edge_exclusion_ratio=side_edge_exclusion_ratio)
+    return result[:5]

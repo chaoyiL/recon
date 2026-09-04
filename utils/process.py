@@ -1,4 +1,4 @@
-"""轮廓点加工：中轴线估计、按 u 带宽过滤、侧边缘空间重建等。"""
+"""从分割 mask 提取两侧包络线并进行侧边缘空间重建。"""
 
 from __future__ import annotations
 
@@ -12,57 +12,34 @@ from scipy.sparse import hstack, lil_matrix, vstack
 from scipy.sparse.linalg import lsmr
 
 
-def contour_center_u(contour: np.ndarray) -> float:
-    """边缘轮廓中轴线 u0：所有轮廓点 u 坐标的平均值。"""
-    points = np.asarray(contour).reshape(-1, 2)
-    if points.size == 0:
-        raise ValueError("contour 为空，无法计算中轴线")
-    return float(np.mean(points[:, 0]))
-
-
-def filter_contour_by_u_band(
-    contour: np.ndarray,
-    u0: float,
-    d: float,
+def extract_mask_side_boundaries(
+    mask: np.ndarray,
     *,
-    min_v: float = 5.0,
-) -> list[np.ndarray]:
-    """删除 contour 中 u ∈ [u0-d, u0+d] 或 v < min_v 的点，返回剩余连通折线段。"""
-    if d < 0:
-        raise ValueError("d 必须是非负数")
+    min_v: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """逐行提取二值 mask 的最左/最右点，不把顶部横边当作侧边。
 
-    points = np.asarray(contour).reshape(-1, 2)
-    if points.size == 0:
-        return []
+    与沿闭合 contour 删除中轴带不同，每个有效图像行严格只贡献两个点；
+    因而顶部/底部横边的内部点不会进入任一侧边。mask 中间的小孔也不会
+    改变外侧包络。返回值均为按 ``v`` 递增的 ``(u, v)`` 浮点数组。
+    """
+    values = np.asarray(mask, dtype=np.bool_)
+    if values.ndim != 2 or min(values.shape, default=0) < 1:
+        raise ValueError("mask 必须是非空二维数组")
+    if not isinstance(min_v, int) or isinstance(min_v, bool) or min_v < 0:
+        raise ValueError("min_v 必须是非负整数")
 
-    outside_u_band = (points[:, 0] < u0 - d) | (points[:, 0] > u0 + d)
-    keep = outside_u_band & (points[:, 1] >= min_v)
-    if not np.any(keep):
-        return []
-
-    segments: list[np.ndarray] = []
-    current: list[np.ndarray] = []
-    for point, retained in zip(points, keep):
-        if retained:
-            current.append(point)
-            continue
-        if current:
-            segments.append(np.asarray(current, dtype=np.int32).reshape(-1, 1, 2))
-            current = []
-    if current:
-        segments.append(np.asarray(current, dtype=np.int32).reshape(-1, 1, 2))
-
-    # 闭合轮廓首尾都保留时，合并为同一条折线。
-    if (
-        len(segments) >= 2
-        and keep[0]
-        and keep[-1]
-        and not np.array_equal(segments[0], segments[-1])
-    ):
-        merged = np.concatenate([segments[-1], segments[0]], axis=0)
-        segments = [merged, *segments[1:-1]]
-
-    return [segment for segment in segments if len(segment) >= 2]
+    height, width = values.shape
+    rows = np.arange(height, dtype=np.int32)
+    has_point = np.any(values, axis=1)
+    left = np.argmax(values, axis=1)
+    right = width - 1 - np.argmax(values[:, ::-1], axis=1)
+    valid = has_point & (rows >= min_v) & (left < right)
+    valid_rows = rows[valid]
+    return (
+        np.column_stack([left[valid], valid_rows]).astype(np.float64),
+        np.column_stack([right[valid], valid_rows]).astype(np.float64),
+    )
 
 
 def _segments_to_points(segments: Sequence[np.ndarray]) -> np.ndarray:
@@ -754,12 +731,20 @@ class EdgeReconstructor:
         s2: float,
         *,
         sample_count: int = 100,
+        matching_refinement_iterations: int = 4,
     ) -> None:
         self.K = np.asarray(K, dtype=np.float64).reshape(3, 3)
         self.distortion = np.asarray(distortion, dtype=np.float64).reshape(-1)
         self.s1 = float(s1)
         self.s2 = float(s2)
         self.sample_count = int(sample_count)
+        if (
+            not isinstance(matching_refinement_iterations, int)
+            or isinstance(matching_refinement_iterations, bool)
+            or matching_refinement_iterations < 2
+        ):
+            raise ValueError("matching_refinement_iterations 必须是至少为 2 的整数")
+        self.matching_refinement_iterations = matching_refinement_iterations
         self.rotation_vector = np.zeros(3, dtype=np.float64)
         self.tx = 0.0
         self.calibrated = False
@@ -805,31 +790,22 @@ class EdgeReconstructor:
                 np.zeros(3, dtype=np.float64),
                 0.0,
             )
-            rotation, tx, h, z, first_rms = _optimize_shared_curve(
-                left_uv,
-                right_uv,
-                self.K,
-                self.s1,
-                self.s2,
-                np.zeros(3, dtype=np.float64),
-                0.0,
-                initial_h,
-                initial_z,
-            )
-            right_indices = _monotone_right_matches(
-                left_uv,
-                right_dense_uv,
-                self.K,
-                self.s1,
-                self.s2,
-                rotation,
-                tx,
-            )
-            matched_right_uv = right_dense_uv[right_indices]
-            second_rotation, second_tx, second_h, second_z, second_rms = (
-                _optimize_shared_curve(
+            rotation = np.zeros(3, dtype=np.float64)
+            tx = 0.0
+            h = initial_h
+            z = initial_z
+            matched_indices: np.ndarray | None = None
+            best: tuple[
+                np.ndarray, float, np.ndarray, np.ndarray, float, np.ndarray
+            ] | None = None
+
+            # 交替执行“联合优化 -> 单调匹配”。每次优化只使用上一轮已经
+            # 固定的对应关系，匹配稳定后停止；达到上限时仍返回重投影 RMS
+            # 最小且与其对应点严格一致的那一轮，避免输出半轮更新的状态。
+            for _ in range(self.matching_refinement_iterations):
+                rotation, tx, h, z, rms = _optimize_shared_curve(
                     left_uv,
-                    matched_right_uv,
+                    right_uv,
                     self.K,
                     self.s1,
                     self.s2,
@@ -838,20 +814,33 @@ class EdgeReconstructor:
                     h,
                     z,
                 )
-            )
-            if second_rms <= first_rms:
-                right_uv = matched_right_uv
-                rotation, tx, h, z, rms = (
-                    second_rotation,
-                    second_tx,
-                    second_h,
-                    second_z,
-                    second_rms,
+                if best is None or rms <= best[4]:
+                    best = (
+                        rotation.copy(),
+                        tx,
+                        h.copy(),
+                        z.copy(),
+                        rms,
+                        right_uv.copy(),
+                    )
+                next_indices = _monotone_right_matches(
+                    left_uv,
+                    right_dense_uv,
+                    self.K,
+                    self.s1,
+                    self.s2,
+                    rotation,
+                    tx,
                 )
-            else:
-                # 错误外参下的 Y/Z 最近邻也可能形成错误匹配；只接受能改善
-                # 最终重投影一致性的动态规划结果。
-                rms = first_rms
+                if matched_indices is not None and np.array_equal(
+                    next_indices, matched_indices
+                ):
+                    break
+                matched_indices = next_indices
+                right_uv = right_dense_uv[next_indices]
+
+            assert best is not None
+            rotation, tx, h, z, rms, right_uv = best
             self.rotation_vector = rotation.copy()
             self.tx = tx
             self.calibrated = True
@@ -1148,8 +1137,70 @@ def build_colored_surface_mesh(
     return grid.reshape(-1, 3), triangles, colors
 
 
+def _surface_grid_and_validity(
+    xyz_grid: np.ndarray,
+    valid_mask: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """校验规则三维网格，并返回网格和逐顶点有效标记。"""
+    grid = np.asarray(xyz_grid, dtype=np.float64)
+    if grid.ndim != 3 or grid.shape[-1] != 3 or min(grid.shape[:2]) < 2:
+        raise ValueError("xyz_grid 必须是至少 2x2 的 rows x columns x 3 数组")
+    if not np.isfinite(grid).all():
+        raise ValueError("曲面网格包含非有限数值")
+    valid = np.ones(grid.shape[:2], dtype=np.bool_)
+    if valid_mask is not None:
+        supplied = np.asarray(valid_mask, dtype=np.bool_)
+        if supplied.shape != grid.shape[:2]:
+            raise ValueError("valid_mask 尺寸必须与 xyz_grid 前两维一致")
+        valid &= supplied
+    return grid, valid
+
+
+def build_gray_surface_points(
+    xyz_grid: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    gray_color: Sequence[float] = (0.35, 0.35, 0.35),
+) -> tuple[np.ndarray, np.ndarray]:
+    """把规则曲面转换成白底论文图使用的单色高密度点云。"""
+    grid, valid = _surface_grid_and_validity(xyz_grid, valid_mask)
+    color = np.asarray(gray_color, dtype=np.float64)
+    if color.shape != (3,) or not np.isfinite(color).all() \
+            or np.any(color < 0) or np.any(color > 1):
+        raise ValueError("gray_color 必须是三个位于 [0,1] 的有限数")
+    points = grid[valid]
+    colors = np.broadcast_to(color, (points.shape[0], 3)).copy()
+    return points, colors
+
+
+def build_gray_surface_grid(
+    xyz_grid: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    gray_color: Sequence[float] = (0.35, 0.35, 0.35),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """构造规则曲面的单色行列线，不添加三角网格的对角线。"""
+    grid, valid = _surface_grid_and_validity(xyz_grid, valid_mask)
+    color = np.asarray(gray_color, dtype=np.float64)
+    if color.shape != (3,) or not np.isfinite(color).all() \
+            or np.any(color < 0) or np.any(color > 1):
+        raise ValueError("gray_color 必须是三个位于 [0,1] 的有限数")
+
+    rows, columns = grid.shape[:2]
+    indices = np.arange(rows * columns, dtype=np.int32).reshape(rows, columns)
+    horizontal = np.stack(
+        [indices[:, :-1], indices[:, 1:]], axis=-1).reshape(-1, 2)
+    vertical = np.stack(
+        [indices[:-1, :], indices[1:, :]], axis=-1).reshape(-1, 2)
+    lines = np.concatenate([horizontal, vertical], axis=0)
+    flat_valid = valid.reshape(-1)
+    lines = lines[np.all(flat_valid[lines], axis=1)]
+    colors = np.broadcast_to(color, (lines.shape[0], 3)).copy()
+    return grid.reshape(-1, 3), lines, colors
+
+
 class SurfaceMeshVisualizer:
-    """非阻塞 Open3D 曲面窗口，几何表示形变、顶点颜色表示法向深度。"""
+    """非阻塞 Open3D 曲面窗口，支持深度网格、灰色点云和灰色栅格。"""
 
     def __init__(
         self,
@@ -1157,16 +1208,41 @@ class SurfaceMeshVisualizer:
         window_name: str = "Realtime deformation depth",
         depth_range_mm: float = 2.0,
         show_coordinate_frame: bool = False,
+        render_style: str = "depth_mesh",
+        gray_color: Sequence[float] = (0.35, 0.35, 0.35),
+        point_size: float = 1.0,
+        grid_line_width: float = 1.0,
+        projection: str = "perspective",
     ) -> None:
         if not np.isfinite(depth_range_mm) or depth_range_mm <= 0:
             raise ValueError("depth_range_mm 必须是有限正数")
         if not isinstance(show_coordinate_frame, bool):
             raise ValueError("show_coordinate_frame 必须是布尔值")
+        if render_style not in {"depth_mesh", "gray_points", "gray_grid"}:
+            raise ValueError(
+                "render_style 必须是 depth_mesh、gray_points 或 gray_grid")
+        color = np.asarray(gray_color, dtype=np.float64)
+        if color.shape != (3,) or not np.isfinite(color).all() \
+                or np.any(color < 0) or np.any(color > 1):
+            raise ValueError("gray_color 必须是三个位于 [0,1] 的有限数")
+        if not np.isfinite(point_size) or point_size <= 0:
+            raise ValueError("point_size 必须是有限正数")
+        if not np.isfinite(grid_line_width) or grid_line_width <= 0:
+            raise ValueError("grid_line_width 必须是有限正数")
+        if projection not in {"perspective", "orthographic"}:
+            raise ValueError("projection 必须是 perspective 或 orthographic")
         self.window_name = window_name
         self.depth_range_mm = float(depth_range_mm)
         self.show_coordinate_frame = show_coordinate_frame
+        self.render_style = render_style
+        self.gray_color = color
+        self.point_size = float(point_size)
+        self.grid_line_width = float(grid_line_width)
+        self.projection = projection
         self._vis = None
         self._mesh: object | None = None
+        self._pcd: object | None = None
+        self._lines: object | None = None
         self._frame: object | None = None
         self._closed = False
         self._geometry_added = False
@@ -1187,7 +1263,12 @@ class SurfaceMeshVisualizer:
             self._vis = None
             self._closed = True
             return False
-        self._mesh = o3d.geometry.TriangleMesh()
+        if self.render_style == "depth_mesh":
+            self._mesh = o3d.geometry.TriangleMesh()
+        elif self.render_style == "gray_points":
+            self._pcd = o3d.geometry.PointCloud()
+        else:
+            self._lines = o3d.geometry.LineSet()
         self._frame = (o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
                        if self.show_coordinate_frame else None)
         option = self._vis.get_render_option()
@@ -1195,8 +1276,12 @@ class SurfaceMeshVisualizer:
             # 顶点色直接表达位移；关闭 Open3D 默认灯光即可彻底去掉镜面高光和
             # 随观察角度移动的亮斑。
             option.light_on = False
-            option.background_color = np.asarray([0.025, 0.027, 0.03])
+            option.background_color = np.asarray(
+                [0.025, 0.027, 0.03] if self.render_style == "depth_mesh"
+                else [1.0, 1.0, 1.0])
             option.mesh_show_back_face = True
+            option.point_size = self.point_size
+            option.line_width = self.grid_line_width
         return True
 
     @staticmethod
@@ -1224,6 +1309,10 @@ class SurfaceMeshVisualizer:
         control.set_lookat(center.tolist())
         control.set_front([0.35, -0.45, -0.82])
         control.set_up([0.0, -1.0, 0.0])
+        if self.projection == "orthographic":
+            # Legacy Visualizer 没有独立的正交相机接口；把视场角压到允许的
+            # 最小值可得到稳定的近正交外观，避免近大远小破坏毫米尺度观感。
+            control.change_field_of_view(step=-90.0)
         control.set_zoom(0.55)
 
     def update(
@@ -1238,18 +1327,42 @@ class SurfaceMeshVisualizer:
             return False
         import open3d as o3d
 
-        vertices, triangles, colors = build_colored_surface_mesh(
-            xyz_grid,
-            normal_displacement,
-            valid_mask=valid_mask,
-            depth_range_mm=self.depth_range_mm,
-        )
-        assert self._vis is not None and self._mesh is not None
-        self._mesh.vertices = o3d.utility.Vector3dVector(vertices)
-        self._mesh.triangles = o3d.utility.Vector3iVector(triangles)
-        self._mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+        assert self._vis is not None
+        if self.render_style == "depth_mesh":
+            vertices, triangles, colors = build_colored_surface_mesh(
+                xyz_grid,
+                normal_displacement,
+                valid_mask=valid_mask,
+                depth_range_mm=self.depth_range_mm,
+            )
+            assert self._mesh is not None
+            self._mesh.vertices = o3d.utility.Vector3dVector(vertices)
+            self._mesh.triangles = o3d.utility.Vector3iVector(triangles)
+            self._mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+            geometry = self._mesh
+        elif self.render_style == "gray_points":
+            vertices, colors = build_gray_surface_points(
+                xyz_grid, valid_mask=valid_mask, gray_color=self.gray_color)
+            assert self._pcd is not None
+            self._pcd.points = o3d.utility.Vector3dVector(vertices)
+            self._pcd.colors = o3d.utility.Vector3dVector(colors)
+            geometry = self._pcd
+        else:
+            vertices, lines, colors = build_gray_surface_grid(
+                xyz_grid, valid_mask=valid_mask, gray_color=self.gray_color)
+            assert self._lines is not None
+            self._lines.points = o3d.utility.Vector3dVector(vertices)
+            self._lines.lines = o3d.utility.Vector2iVector(lines)
+            self._lines.colors = o3d.utility.Vector3dVector(colors)
+            geometry = self._lines
+        if vertices.shape[0] == 0:
+            if not self._vis.poll_events():
+                self.close()
+                return False
+            self._vis.update_renderer()
+            return True
         if not self._geometry_added:
-            self._vis.add_geometry(self._mesh, reset_bounding_box=True)
+            self._vis.add_geometry(geometry, reset_bounding_box=True)
             if self._frame is not None:
                 self._vis.add_geometry(self._frame, reset_bounding_box=False)
             self._geometry_added = True
@@ -1257,7 +1370,7 @@ class SurfaceMeshVisualizer:
             if self._frame is not None:
                 self._vis.update_geometry(self._frame)
         else:
-            self._vis.update_geometry(self._mesh)
+            self._vis.update_geometry(geometry)
         if not self._vis.poll_events():
             self.close()
             return False
@@ -1269,6 +1382,8 @@ class SurfaceMeshVisualizer:
             self._vis.destroy_window()
             self._vis = None
         self._mesh = None
+        self._pcd = None
+        self._lines = None
         self._frame = None
         self._closed = True
         self._geometry_added = False

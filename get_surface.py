@@ -1,4 +1,4 @@
-"""从固定曝光相机实时读取帧，并使用 SAM2 做多对象点提示分割。"""
+"""从固定曝光相机读取帧，分割曲面并实时重建。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import cv2
 import jax
-from jax import dlpack as jax_dlpack
 import numpy as np
 
 from utils.camera import open_camera
@@ -28,38 +27,32 @@ from utils.config import (
     require_keys,
 )
 from utils.jax_reconstruction import (
+    SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
     prepare_edge_curves_from_masks_jax,
-    reconstruct_surface_from_masks_jax,
+    reconstruct_material_surface_from_masks_jax,
+    reference_material_surface_state_jax,
 )
 from utils.lightfield import choose_device
+from utils.material_surface import MATERIAL_COORDINATE_MODE
 from utils.process import (
     EdgePointCloudVisualizer,
     EdgeReconstructor,
     ReconstructionPointSet,
     build_reconstruction_point_set,
     concatenate_point_sets,
-    contour_center_u,
-    filter_contour_by_u_band,
+    extract_mask_side_boundaries,
 )
-from utils.sam2_surface import (
-    MaskRefineConfig,
-    Prompts,
-    SurfaceSegmenter,
+from utils.surface_mask import MaskRefineConfig,Prompts
+from utils.surface_segmentation import (
+    SurfaceSegmentationBackend,
+    parse_surface_segmentation_config,refine_masks_numpy,
 )
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 
 
-def torch_tensor_to_jax(tensor: object) -> jax.Array:
-    """通过 DLPack 共享 Torch Tensor，不经过 NumPy/CPU 拷贝。"""
-    contiguous = getattr(tensor, "contiguous", None)
-    if contiguous is None:
-        raise TypeError("Torch→JAX 输入必须是 Tensor")
-    return jax_dlpack.from_dlpack(contiguous())
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SAM2 多点提示实时相机分割")
+    parser = argparse.ArgumentParser(description="曲面分割与实时三维重建")
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_PATH,
@@ -74,37 +67,15 @@ def parse_mask_refine(raw_refine: Any) -> MaskRefineConfig:
     if not isinstance(raw_refine, Mapping):
         raise ConfigError("get_surface.mask_refine 必须是字典或 null")
 
-    known = {"enabled", "close_kernel", "open_kernel", "blur_kernel", "keep_largest"}
+    known = {"enabled"}
     unknown = set(raw_refine) - known
     if unknown:
         raise ConfigError(f"get_surface.mask_refine 包含未知字段: {sorted(unknown)}")
 
-    defaults = MaskRefineConfig()
-    enabled = raw_refine.get("enabled", defaults.enabled)
-    close_kernel = raw_refine.get("close_kernel", defaults.close_kernel)
-    open_kernel = raw_refine.get("open_kernel", defaults.open_kernel)
-    blur_kernel = raw_refine.get("blur_kernel", defaults.blur_kernel)
-    keep_largest = raw_refine.get("keep_largest", defaults.keep_largest)
-
+    enabled = raw_refine.get("enabled", MaskRefineConfig.enabled)
     if not isinstance(enabled, bool):
         raise ConfigError("get_surface.mask_refine.enabled 必须是 true 或 false")
-    if not isinstance(keep_largest, bool):
-        raise ConfigError("get_surface.mask_refine.keep_largest 必须是 true 或 false")
-    for name, value in (
-        ("close_kernel", close_kernel),
-        ("open_kernel", open_kernel),
-        ("blur_kernel", blur_kernel),
-    ):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ConfigError(f"get_surface.mask_refine.{name} 必须是非负整数")
-
-    return MaskRefineConfig(
-        enabled=enabled,
-        close_kernel=close_kernel,
-        open_kernel=open_kernel,
-        blur_kernel=blur_kernel,
-        keep_largest=keep_largest,
-    )
+    return MaskRefineConfig(enabled=enabled)
 
 
 def parse_prompts(raw_prompts: Any) -> Prompts:
@@ -201,24 +172,21 @@ def draw_center_u_line(
     )
 
 
-def extract_filtered_edges(
+def extract_side_edges(
     results: dict[str | int, np.ndarray],
-    center_band_d: float,
 ) -> list[tuple[str | int, float, list[np.ndarray]]]:
-    """从分割结果提取最大轮廓的中轴线与侧边缘折线。"""
+    """逐行提取 mask 左右包络线，横向封口边不会进入结果。"""
     edges: list[tuple[str | int, float, list[np.ndarray]]] = []
     for label, mask in results.items():
-        contours, _ = cv2.findContours(
-            mask.astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_NONE,
-        )
-        if not contours:
+        left, right = extract_mask_side_boundaries(mask)
+        if left.shape[0] < 2 or right.shape[0] < 2:
             continue
-        contour = max(contours, key=cv2.contourArea)
-        u0 = contour_center_u(contour)
-        filtered = filter_contour_by_u_band(contour, u0, center_band_d)
-        edges.append((label, u0, filtered))
+        u0 = float(np.median(0.5 * (left[:, 0] + right[:, 0])))
+        side_polylines = [
+            np.round(points).astype(np.int32).reshape(-1, 1, 2)
+            for points in (left, right)
+        ]
+        edges.append((label, u0, side_polylines))
     return edges
 
 
@@ -236,7 +204,6 @@ def draw_results(
     results: dict[str | int, np.ndarray],
     fps: float,
     *,
-    center_band_d: float = 40.0,
     edges: list[tuple[str | int, float, list[np.ndarray]]] | None = None,
     repaired_edges: list[np.ndarray] | None = None,
     pose: tuple[np.ndarray, float, float] | None = None,
@@ -244,27 +211,24 @@ def draw_results(
     visualization = frame.copy()
     edge_map = {
         label: (u0, filtered)
-        for label, u0, filtered in (edges or extract_filtered_edges(results, center_band_d))
+        for label, u0, filtered in (edges or extract_side_edges(results))
     }
 
     for label, mask in results.items():
-        color = _label_color(label)
-        contours, _ = cv2.findContours(
-            mask.astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_NONE,
-        )
-        if not contours:
+        if not np.any(mask):
             continue
-
-        contour = max(contours, key=cv2.contourArea)
-        cv2.drawContours(visualization, [contour], -1, color, 2, cv2.LINE_AA)
 
         if label in edge_map:
             u0, filtered = edge_map[label]
         else:
-            u0 = contour_center_u(contour)
-            filtered = filter_contour_by_u_band(contour, u0, center_band_d)
+            left, right = extract_mask_side_boundaries(mask)
+            if left.shape[0] < 2 or right.shape[0] < 2:
+                continue
+            u0 = float(np.median(0.5 * (left[:, 0] + right[:, 0])))
+            filtered = [
+                np.round(points).astype(np.int32).reshape(-1, 1, 2)
+                for points in (left, right)
+            ]
 
         draw_center_u_line(visualization, u0)
         cv2.polylines(
@@ -501,23 +465,28 @@ def point_set_from_surface_grids(
 def save_uv_xyz_map(
     image_path: str | Path,
     point_set: ReconstructionPointSet,
+    *,
+    metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """把全局逐点 XYZ/UV/ST 映射保存为与图像同名的压缩 NPZ。"""
     path = Path(image_path).expanduser()
     map_path = path.with_name(f"{path.stem}_uv_xyz.npz")
     map_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        map_path,
-        xyz=point_set.xyz,
-        uv=point_set.uv,
-        st=point_set.st,
-        undistorted_uv=point_set.undistorted_uv,
-        camera_depth=point_set.camera_depth,
-        is_edge=point_set.is_edge,
-        cross_section_index=point_set.cross_section_index,
-        cross_section_alpha=point_set.cross_section_alpha,
-        source_index=point_set.source_index,
-    )
+    fields: dict[str, object] = {
+        "xyz":point_set.xyz,"uv":point_set.uv,"st":point_set.st,
+        "undistorted_uv":point_set.undistorted_uv,
+        "camera_depth":point_set.camera_depth,"is_edge":point_set.is_edge,
+        "cross_section_index":point_set.cross_section_index,
+        "cross_section_alpha":point_set.cross_section_alpha,
+        "source_index":point_set.source_index,
+    }
+    if metadata is not None:
+        overlap=fields.keys()&metadata.keys()
+        if overlap:
+            raise ValueError(
+                f"UV-XYZ 元数据不能覆盖数据字段: {sorted(overlap)}")
+        fields.update(metadata)
+    np.savez_compressed(map_path,**fields)
     return map_path
 
 
@@ -565,21 +534,12 @@ def main() -> None:
         )
         camera = parse_camera_config(camera_section)
         require_keys(
-            surface_section,
-            "get_surface",
-            "model",
-            "save",
-            "no_display",
-            "max_frames",
-            "prompts",
-        )
+            surface_section, "get_surface", "save", "no_display",
+            "max_frames", "prompts")
 
-        model_id = surface_section["model"]
         save_path = surface_section["save"]
         no_display = surface_section["no_display"]
         max_frames = surface_section["max_frames"]
-        if not isinstance(model_id, str) or not model_id:
-            raise ConfigError("get_surface.model 必须是非空字符串")
         if save_path is not None and not isinstance(save_path, str):
             raise ConfigError("get_surface.save 必须是字符串或 null")
         if not isinstance(no_display, bool):
@@ -592,28 +552,13 @@ def main() -> None:
             raise ConfigError("get_surface.max_frames 必须是非负整数")
         prompts = parse_prompts(surface_section["prompts"])
         mask_refine = parse_mask_refine(surface_section.get("mask_refine"))
-        compile_sam = surface_section.get("torch_compile", True)
-        sam_frame_interval = surface_section.get("sam_frame_interval", 1)
-        sam_memory_frames = surface_section.get("sam_memory_frames", 7)
-        if not isinstance(compile_sam, bool):
-            raise ConfigError("get_surface.torch_compile 必须是布尔值")
-        if not isinstance(sam_frame_interval, int) \
-                or isinstance(sam_frame_interval, bool) \
-                or sam_frame_interval < 1:
-            raise ConfigError("get_surface.sam_frame_interval 必须为正整数")
-        if not isinstance(sam_memory_frames, int) \
-                or isinstance(sam_memory_frames, bool) \
-                or sam_memory_frames < 1:
-            raise ConfigError("get_surface.sam_memory_frames 必须为正整数")
+        segmentation = parse_surface_segmentation_config(
+            surface_section, config_path=args.config)
+        if segmentation.mode != "liteseg":
+            raise ConfigError(
+                "get_surface 实时入口只允许 PP-LiteSeg；"
+                "SAM2 仅用于 PP-LiteSeg 自动标注教师")
         jax_device_name = lightfield_section.get("device", "gpu")
-        center_band_d = surface_section.get("center_band_d", 40)
-        if (
-            not isinstance(center_band_d, (int, float))
-            or isinstance(center_band_d, bool)
-            or center_band_d < 0
-        ):
-            raise ConfigError("get_surface.center_band_d 必须是非负数")
-        center_band_d = float(center_band_d)
         calibration_output = None
         try:
             calibration_section = load_config_sections(args.config, "calibration")[0]
@@ -628,33 +573,19 @@ def main() -> None:
             config_path=args.config,
             calibration_output=calibration_output,
         )
-    except ConfigError as error:
+        material_template=reconstruction.material_template
+    except (ConfigError,OSError,ValueError) as error:
         print(f"配置错误: {error}", file=sys.stderr)
         sys.exit(2)
 
-    print(f"正在加载模型: {model_id}")
-    segmenter = SurfaceSegmenter(
-        model_id=model_id,
-        mask_refine=mask_refine,
-        compile_model=compile_sam,
-        memory_frames=sam_memory_frames,
-    )
+    print(f"正在加载分割模型: {segmentation.description}")
+    segmenter = SurfaceSegmentationBackend(
+        segmentation, prompts=prompts, mask_refine=mask_refine)
     print(f"模型已加载到: {segmenter.device}")
-    print(
-        "SAM2 视频记忆已启用: "
-        f"history_frames={segmenter.history_frames}, "
-        f"torch.compile={'on' if compile_sam else 'off'}, "
-        f"每 {sam_frame_interval} 帧更新一次"
-    )
+    print(f"PP-LiteSeg 每 {segmentation.frame_interval} 帧更新一次")
     if mask_refine.enabled:
-        print(
-            "mask 后处理已启用: "
-            f"close={mask_refine.close_kernel}, "
-            f"open={mask_refine.open_kernel}, "
-            f"blur={mask_refine.blur_kernel}, "
-            f"keep_largest={mask_refine.keep_largest}"
-        )
-    print(f"中轴线过滤带宽: center_band_d={center_band_d}")
+        print("mask 后处理: 最大外轮廓、孔洞填充（不修正圆角）")
+    print("侧边提取: 逐行最左/最右包络（不再使用中轴删除带）")
     K = reconstruction.K
     print(
         "边缘重建: "
@@ -674,9 +605,15 @@ def main() -> None:
         f"{reconstruction.residual_texture_columns}, "
         f"uv_boundary_lambda={reconstruction.uv_boundary_smooth_lambda}, "
         f"uv_boundary_huber={reconstruction.uv_boundary_huber_delta_px}px, "
+        f"side_edge_exclusion={reconstruction.side_edge_exclusion_ratio:.1%}/端, "
         f"show_point_cloud={reconstruction.show_point_cloud}"
     )
-    print("整体重建仅使用当前 SAM 边界：无时间先验、无历史状态拒绝门控")
+    print(
+        "固定材料坐标已启用："
+        f"size={material_template.width_mm:.3f}x"
+        f"{material_template.length_mm:.3f}mm，"
+        f"s0={material_template.s_zero_endpoint}，"
+        f"sha256={material_template.sha256[:12]}")
     print("外参策略: 首个有效边缘帧标定一次 R/tx，后续帧锁定外参并线性重建")
     device = choose_device(jax_device_name)
     if reconstruction.distortion_coefficients.size != 5:
@@ -701,8 +638,8 @@ def main() -> None:
     )
     if not no_display:
         print("按 q 或 Esc 退出；按 s 保存当前叠加结果")
-        cv2.namedWindow("SAM2 surface", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("SAM2 masks", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("surface segmentation", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("surface masks", cv2.WINDOW_NORMAL)
 
     reconstructor = EdgeReconstructor(
         K,
@@ -716,30 +653,42 @@ def main() -> None:
         np.asarray(reconstruction.distortion_coefficients, np.float32), device)
     inverse_camera_gpu = jax.device_put(
         np.asarray(np.linalg.inv(K), np.float32), device)
+    template_st_gpu=jax.device_put(material_template.st,device)
+    template_lengths_gpu=jax.device_put(
+        material_template.segment_lengths_mm,device)
+    template_x_gpu=jax.device_put(material_template.x_coordinates_mm,device)
+    template_curve_gpu=jax.device_put(
+        material_template.reference_curve_yz,device)
+    template_angles_gpu=jax.device_put(
+        material_template.reference_angles_rad,device)
+    material_cfg=reconstruction.material_surface
+    runtime_cfg=lightfield_section.get("runtime",{})
+    if not isinstance(runtime_cfg,dict):
+        raise ConfigError("lightfield.runtime 必须是字典")
+    raster_max_width=int(runtime_cfg.get(
+        "gpu_raster_max_triangle_width",128))
+    raster_max_height=int(runtime_cfg.get(
+        "gpu_raster_max_triangle_height",64))
+    if raster_max_width<1 or raster_max_height<1:
+        raise ConfigError("runtime gpu_raster_max_triangle_* 参数必须为正整数")
 
-    def gpu_mask_kernel(size: int) -> int:
-        if not mask_refine.enabled or size <= 0:
-            return 0
-        return size if size % 2 else size + 1
-
-    gpu_mask_close_kernel = gpu_mask_kernel(mask_refine.close_kernel)
-    gpu_mask_open_kernel = gpu_mask_kernel(mask_refine.open_kernel)
-    gpu_mask_blur_kernel = gpu_mask_kernel(mask_refine.blur_kernel)
+    # PP-LiteSeg 输出在 CPU 上执行与 SAM2 教师标签完全相同的 OpenCV
+    # 后处理；JAX 只消费清理结果，不再重复改变边界。
+    print("PP-LiteSeg mask 使用与 SAM2 教师标签相同的 OpenCV 完整后处理")
     prepare_curves_gpu = jax.jit(
         lambda masks: prepare_edge_curves_from_masks_jax(
             masks,
             camera_matrix_gpu,
             distortion_gpu,
             reconstructor.sample_count,
-            center_band_d,
-            close_kernel=gpu_mask_close_kernel,
-            open_kernel=gpu_mask_open_kernel,
-            blur_kernel=gpu_mask_blur_kernel,
+            side_edge_exclusion_ratio=
+                reconstruction.side_edge_exclusion_ratio,
         )[1:]
     )
 
-    def reconstruct_geometry_gpu_impl(raw_masks,rotation,tx):
-        return reconstruct_surface_from_masks_jax(
+    def reconstruct_geometry_gpu_impl(
+            raw_masks,rotation,tx,previous_state,initialized):
+        return reconstruct_material_surface_from_masks_jax(
             raw_masks,
             camera_matrix_gpu,
             distortion_gpu,
@@ -749,14 +698,26 @@ def main() -> None:
             reconstruction.s2,
             tx,
             reconstructor.sample_count,
-            center_band_d,
             reconstruction.pair_fill_count,
             reconstruction.uv_boundary_smooth_lambda,
             reconstruction.uv_boundary_huber_delta_px,
-            curve_convexity=reconstruction.curve_convexity,
-            close_kernel=gpu_mask_close_kernel,
-            open_kernel=gpu_mask_open_kernel,
-            blur_kernel=gpu_mask_blur_kernel,
+            previous_state,template_st_gpu,template_lengths_gpu,
+            template_x_gpu,initialized=initialized,
+            initial_calibration_maximum_rms_px=
+                material_cfg.initial_calibration_maximum_rms_px,
+            calibration_maximum_rms_px=
+                material_cfg.calibration_maximum_rms_px,
+            calibration_minimum_confidence=
+                material_cfg.calibration_minimum_confidence,
+            match_confidence_scale_mm=
+                material_cfg.match_confidence_scale_mm,
+            rms_confidence_scale_px=material_cfg.rms_confidence_scale_px,
+            confidence_floor=material_cfg.confidence_floor,
+            bend_direction=material_cfg.bend_direction,
+            maximum_uv_triangle_width_px=raster_max_width,
+            maximum_uv_triangle_height_px=raster_max_height,
+            side_edge_exclusion_ratio=
+                reconstruction.side_edge_exclusion_ratio,
         )
 
     reconstruct_geometry_gpu = jax.jit(reconstruct_geometry_gpu_impl)
@@ -774,6 +735,9 @@ def main() -> None:
     rotation_gpu: jax.Array | None = None
     tx_gpu: jax.Array | None = None
     geometry_state_gpu: tuple[jax.Array, ...] | None = None
+    material_state_gpu = None
+    material_initialized_gpu=jax.device_put(
+        np.asarray(False,np.bool_),device)
 
     try:
         while max_frames <= 0 or frame_count < max_frames:
@@ -784,16 +748,17 @@ def main() -> None:
             started_at = time.perf_counter()
             current_frame_number = frame_count
             frame_count += 1
-            update_sam = (
+            update_segmentation = (
                 mask_gpu is None
-                or current_frame_number % sam_frame_interval == 0
+                or current_frame_number % segmentation.frame_interval == 0
             )
-            if update_sam:
-                mask_labels, mask_tensor, _ = segmenter.segment_tensors(
-                    frame, prompts)
-                mask_gpu = torch_tensor_to_jax(mask_tensor)
+            if update_segmentation:
+                mask_labels, mask_tensor = segmenter.segment_tensors(frame)
+                cleaned_masks = refine_masks_numpy(mask_tensor, mask_refine)
+                mask_gpu = jax.device_put(cleaned_masks, device)
                 geometry_state_gpu = None
             assert mask_gpu is not None
+            material_confidence=0.
 
             if not reconstructor.calibrated:
                 initial_left, initial_right, initial_valid = jax.device_get(
@@ -811,22 +776,43 @@ def main() -> None:
                     reconstructor.rotation_vector)[0].astype(np.float32)
                 rotation_gpu, tx_gpu = jax.device_put(
                     (rotation, np.asarray(reconstructor.tx, np.float32)), device)
+                material_state_gpu=reference_material_surface_state_jax(
+                    template_curve_gpu,template_angles_gpu,template_x_gpu,
+                    camera_matrix_gpu,distortion_gpu,rotation_gpu,tx_gpu)
 
             if reconstructor.calibrated:
                 assert rotation_gpu is not None and tx_gpu is not None
+                assert material_state_gpu is not None
                 if geometry_state_gpu is None:
                     geometry_state_gpu=reconstruct_geometry_gpu(
-                        mask_gpu,rotation_gpu,tx_gpu)
+                        mask_gpu,rotation_gpu,tx_gpu,material_state_gpu,
+                        material_initialized_gpu)
+                    material_state_gpu=geometry_state_gpu[1]
+                    material_initialized_gpu=(
+                        material_initialized_gpu|geometry_state_gpu[4])
                 (
                     refined_masks,
-                    xyz_grid,
-                    uv_grid,
+                    material_state_host,
                     st_grid,
-                    depth_grid,
-                    rms_values,
                     reconstruction_valid,
+                    material_tracking_accepted,
                 ) = jax.device_get(geometry_state_gpu)
-                geometry_valid = bool(np.all(reconstruction_valid))
+                xyz_grid=np.asarray(material_state_host.xyz)
+                uv_grid=np.asarray(material_state_host.uv)
+                depth_grid=np.asarray(material_state_host.camera_depth)
+                rms_values=np.asarray(
+                    [material_state_host.reprojection_rms_px],np.float32)
+                material_confidence=float(
+                    material_state_host.matching_confidence)
+                geometry_valid=bool(material_state_host.valid)
+                if not geometry_valid and not bool(material_tracking_accepted):
+                    # 会话尚未锚定时，当前帧也不能作为外参 bootstrap；
+                    # 下一帧从零重新求 R/tx，直到几何候选通过。
+                    reconstructor.calibrated=False
+                    rotation_gpu=None
+                    tx_gpu=None
+                    material_state_gpu=None
+                    geometry_state_gpu=None
                 masks_host = np.asarray(refined_masks, np.bool_)
             else:
                 geometry_valid = False
@@ -838,7 +824,7 @@ def main() -> None:
                 label: np.ascontiguousarray(masks_host[index], dtype=np.bool_)
                 for index, label in enumerate(mask_labels)
             }
-            edges = extract_filtered_edges(results, center_band_d)
+            edges = extract_side_edges(results)
             point_set = ReconstructionPointSet.empty()
             left_xyz = np.zeros((0, 3), np.float32)
             right_xyz = np.zeros((0, 3), np.float32)
@@ -890,11 +876,16 @@ def main() -> None:
                 prompts,
                 results,
                 fps,
-                center_band_d=center_band_d,
                 edges=edges,
                 repaired_edges=repaired_edges,
                 pose=pose,
             )
+            cv2.putText(
+                last_visualization,
+                f"material confidence={material_confidence:.4f}",
+                (12,112),cv2.FONT_HERSHEY_SIMPLEX,.65,
+                (0,255,0) if material_confidence>=.5 else (0,165,255),
+                2,cv2.LINE_AA)
             if not geometry_valid:
                 cv2.putText(
                     last_visualization,
@@ -924,8 +915,8 @@ def main() -> None:
                 print(f"\r已处理 {frame_count} 帧，FPS={fps:.1f}", end="", flush=True)
                 continue
 
-            cv2.imshow("SAM2 surface", last_visualization)
-            cv2.imshow("SAM2 masks", last_masks)
+            cv2.imshow("surface segmentation", last_visualization)
+            cv2.imshow("surface masks", last_masks)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
@@ -936,7 +927,18 @@ def main() -> None:
                     else:
                         print(f"已保存到 {save_path}")
                         if point_set.xyz.shape[0]:
-                            map_path = save_uv_xyz_map(save_path, point_set)
+                            map_path = save_uv_xyz_map(
+                                save_path,point_set,metadata={
+                                    "reconstruction_pipeline":
+                                        SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
+                                    "material_template_sha256":
+                                        material_template.sha256,
+                                    "material_coordinate_mode":
+                                        MATERIAL_COORDINATE_MODE,
+                                    "material_matching_confidence":
+                                        np.asarray(
+                                            material_confidence,np.float32),
+                                })
                             print(f"已保存 UV-XYZ 映射到 {map_path}")
                 else:
                     print("请在 config.yaml 中配置 get_surface.save")
@@ -960,7 +962,15 @@ def main() -> None:
             if cv2.imwrite(str(mask_path), last_masks):
                 print(f"已保存 mask 图到 {mask_path}")
         if last_point_set.xyz.shape[0]:
-            map_path = save_uv_xyz_map(save_path, last_point_set)
+            map_path = save_uv_xyz_map(
+                save_path,last_point_set,metadata={
+                    "reconstruction_pipeline":
+                        SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
+                    "material_template_sha256":material_template.sha256,
+                    "material_coordinate_mode":MATERIAL_COORDINATE_MODE,
+                    "material_matching_confidence":np.asarray(
+                        material_confidence,np.float32),
+                })
             print(f"已保存 UV-XYZ 映射到 {map_path}")
 
 

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local datasets, trained weights, and runtime snapshots.
+dataset/
+runs/
+realtime_snapshots/
+.trt_cache/

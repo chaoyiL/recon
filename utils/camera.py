@@ -26,8 +26,18 @@ def open_camera(
 
     try:
         # V4L2: 1=手动曝光，3=自动曝光。
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-        cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+        if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
+            raise RuntimeError("相机驱动拒绝切换到手动曝光")
+        if not cap.set(cv2.CAP_PROP_EXPOSURE, exposure):
+            raise RuntimeError(f"相机驱动拒绝设置曝光值 {exposure}")
+
+        # 固定焦相机通常返回 false；支持自动对焦的相机则必须成功关闭并回读验证。
+        autofocus_controlled=cap.set(cv2.CAP_PROP_AUTOFOCUS,0)
+        actual_autofocus=float(cap.get(cv2.CAP_PROP_AUTOFOCUS))
+        if autofocus_controlled and math.isfinite(actual_autofocus) \
+                and actual_autofocus>.5:
+            raise RuntimeError(
+                f"自动对焦未成功关闭，驱动回读值={actual_autofocus}")
 
         if not cap.set(cv2.CAP_PROP_AUTO_WB, 0):
             raise RuntimeError("相机驱动不支持或拒绝关闭自动白平衡")
@@ -36,6 +46,13 @@ def open_camera(
                 f"相机驱动不支持或拒绝设置白平衡色温 {white_balance_temperature} K")
         actual_auto_wb=float(cap.get(cv2.CAP_PROP_AUTO_WB))
         actual_temperature=float(cap.get(cv2.CAP_PROP_WB_TEMPERATURE))
+        actual_exposure=float(cap.get(cv2.CAP_PROP_EXPOSURE))
+        exposure_tolerance=max(1.,.1*abs(float(exposure)))
+        if not math.isfinite(actual_exposure) \
+                or abs(actual_exposure-float(exposure))>exposure_tolerance:
+            raise RuntimeError(
+                "手动曝光设置未生效："
+                f"请求={exposure}，回读={actual_exposure}")
         if not math.isfinite(actual_auto_wb) or actual_auto_wb<0 or actual_auto_wb>.5:
             raise RuntimeError(
                 f"自动白平衡未成功关闭，驱动回读值={actual_auto_wb}")

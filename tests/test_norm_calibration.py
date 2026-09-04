@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from calibrate_norm import (
+    _resolve_optional_output,
     build_normal_lut,
     dilate_manual_contact,
     fit_normal_calibration_residual_session,
@@ -26,6 +27,18 @@ from manual_norm_regions import (
 
 
 class NormalCalibrationTest(unittest.TestCase):
+    def test_normal_material_diagnostic_dir_is_separate_and_optional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            relative=_resolve_optional_output(
+                "assets/normal_calibration/material_failures",root)
+            self.assertEqual(
+                relative,
+                root/"assets/normal_calibration/material_failures")
+            self.assertIsNone(_resolve_optional_output(None,root))
+            with self.assertRaisesRegex(ValueError,"路径字符串或 null"):
+                _resolve_optional_output(3,root)  # type: ignore[arg-type]
+
     def synthetic_surface(self):
         height,width=160,200
         y,x=np.meshgrid(np.arange(height),np.arange(width),indexing="ij")
@@ -148,14 +161,14 @@ class NormalCalibrationTest(unittest.TestCase):
         residuals=np.zeros((3,8,6,3),np.float32)
         valid=np.ones((3,8,6),bool)
         model=SimpleNamespace(
-            background_method="direct_fit",
+            background_method="direct_fit_3",
             residual_b_coefficients=np.zeros((3,5,4),np.float32),
             residual_m_coefficients=np.zeros((0,3,5,4),np.float32))
         b=np.ones((3,5,4),np.float32)*.2
         scores=np.zeros((3,3,0),np.float32)
         expected=(b,scores,np.ones(3,np.float32),{})
         lightfield_cfg={
-            "direct_fit":{"session_correction_max_deviation":.12},
+            "direct_fit_3":{"session_correction_max_deviation":.12},
             "calibration":{
                 "lambda_residual_smooth":.02,
                 "lambda_residual_magnitude":.003,

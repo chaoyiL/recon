@@ -1,0 +1,44 @@
+# 兼容旧命令行 --settings PP-LiteSeg/config.yaml 的独立配置。
+# 默认配置已经迁移到仓库根目录 config.yaml 的 pp_liteseg 段。
+# 本文件中的相对路径仍相对于本文件所在目录。
+
+# SAM2 提示点和相机参数从仓库主配置读取。
+project_config: ../config.yaml
+
+labeling:
+  # 可以配置多个文件、目录或 glob。命令行 --video 会覆盖此项。
+  videos:
+    - ../assets/cali_lightfield_videos/*.avi
+  dataset_dir: dataset
+  # SAM2 逐帧推进视频记忆；这里只控制每秒保存多少张监督样本。
+  sample_fps: 2.0
+  # 将这些 SAM2 对象 mask 合并成 surface=1；null 表示合并全部对象。
+  prompt_labels: [surface]
+  save_previews: true
+  minimum_mask_area_ratio: 0.05
+  maximum_mask_area_ratio: 0.95
+  # false：已有数据时停止，防止意外混入旧标注；中断后续跑时改为 true。
+  resume: false
+
+training:
+  # 相对于本文件：../assets/surface_t1 即仓库根目录 assets/surface_t1。
+  output_dir: ../assets/surface_t1
+  device: gpu
+  val_ratio: 0.2
+  seed: 20260828
+  iterations: 5000
+  batch_size: 4
+  learning_rate: 0.005
+  save_interval: 500
+  num_workers: 2
+  precision: fp32
+
+realtime:
+  # train.py 默认把固定形状推理模型导出到这里。
+  model_dir: ../assets/surface_t1/inference_model
+  foreground_class: 1
+  use_tensorrt: false
+  precision: fp16
+  cpu_threads: 4
+  overlay_alpha: 0.45
+  snapshot_dir: realtime_snapshots

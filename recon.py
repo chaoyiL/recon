@@ -13,10 +13,9 @@ from typing import Any
 
 import cv2
 import numpy as np
-import yaml
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr
-from utils.config import (BACKGROUND_METHODS,parse_background_method,
+from utils.config import (BACKGROUND_METHODS,load_config,parse_background_method,
                           resolve_method_path)
 from utils.jax_reconstruction import SURFACE_RECONSTRUCTION_PIPELINE_VERSION
 
@@ -37,6 +36,7 @@ class NormalCalibration:
     background_model_sha256: str | None = None
     reconstruction_pipeline: str = SURFACE_RECONSTRUCTION_PIPELINE_VERSION
     curve_convexity: str = "none"
+    material_template_sha256: str | None = None
 
     def __post_init__(self) -> None:
         slopes=np.asarray(self.slopes,np.float32)
@@ -76,6 +76,13 @@ class NormalCalibration:
                     or any(character not in "0123456789abcdef" for character in digest):
                 raise ValueError(
                     "background_model_sha256 必须是 64 位小写十六进制字符串或 None")
+        if self.material_template_sha256 is not None:
+            digest=self.material_template_sha256
+            if not isinstance(digest,str) or len(digest)!=64 \
+                    or any(character not in "0123456789abcdef"
+                           for character in digest):
+                raise ValueError(
+                    "material_template_sha256 必须是 64 位小写十六进制字符串或 None")
         if self.reconstruction_pipeline!=SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
             raise ValueError("法向 LUT 的整体重建链元数据无效")
         if self.curve_convexity not in {"none","increasing","decreasing"}:
@@ -94,7 +101,7 @@ class NormalCalibration:
         output=Path(path).expanduser()
         output.parent.mkdir(parents=True,exist_ok=True)
         values: dict[str,Any]={
-            "format_version":np.asarray(3,np.int32),
+            "format_version":np.asarray(4,np.int32),
             "color_residual_mode":np.asarray("signed"),
             "slopes":self.slopes,
             "variances":self.variances,
@@ -103,6 +110,8 @@ class NormalCalibration:
             "sigma_ref2":np.asarray(self.sigma_ref2,np.float32),
             "reconstruction_pipeline":np.asarray(self.reconstruction_pipeline),
             "curve_convexity":np.asarray(self.curve_convexity),
+            "material_template_sha256":np.asarray(
+                self.material_template_sha256 or ""),
         }
         if self.original_valid is not None:
             values["original_valid"]=np.asarray(self.original_valid,np.bool_)
@@ -134,7 +143,10 @@ class NormalCalibration:
                 raise ValueError(
                     "旧法向 LUT 未记录完整实时 JAX/凸性重建语义；"
                     "请重新运行 calibrate-norm")
-            if version!=3:
+            if version==3:
+                raise ValueError(
+                    "旧法向 LUT 未绑定固定材料模板；请重新运行 calibrate-norm")
+            if version!=4:
                 raise ValueError(f"不支持的法向标定模型版本: {version}")
             if "color_residual_mode" not in data \
                     or str(data["color_residual_mode"])!="signed":
@@ -156,6 +168,9 @@ class NormalCalibration:
                                          else None),
                 reconstruction_pipeline=str(data["reconstruction_pipeline"]),
                 curve_convexity=str(data["curve_convexity"]),
+                material_template_sha256=(
+                    str(data["material_template_sha256"])
+                    if str(data["material_template_sha256"]) else None),
             )
 
 
@@ -454,8 +469,7 @@ def load_local_reconstruction_settings(
 ) -> LocalReconstructionSettings:
     """读取独立局部重建配置；命令行值优先于 YAML。"""
     source=Path(config_path).expanduser()
-    with source.open("r",encoding="utf-8") as stream:
-        all_config=yaml.safe_load(stream)
+    all_config=load_config(source)
     if not isinstance(all_config,dict):
         raise ValueError("config.yaml 顶层必须是映射")
     raw=all_config.get("local_reconstruction")

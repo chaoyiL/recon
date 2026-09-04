@@ -8,6 +8,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import yaml
+from utils.jax_reconstruction import SURFACE_RECONSTRUCTION_PIPELINE_VERSION
 from utils.gpu_residual_fit import (_adaptive_channel_weights,
                                     fit_direct_geometry_conditioned_field_gpu,
                                     fit_residual_correction_model_gpu)
@@ -16,8 +17,10 @@ from utils.lightfield import (LightFieldModel, bounded_mixing_matrix,
                               bspline_basis, build_canonical_residual_sample_jax,
                               direct_background_field_chunked,
                               direct_background_field_jax,
+                              direct_s_background_field_jax,
+                              direct_s_recurrent_step_jax,
                               direct_geometry_descriptor_jax,
-                              geometry_cache_background_field_jax,
+                              direct_local_geometry_feature_grid_jax,
                               erode_mask_jax, evaluate_rgb_bspline,
                               fit_uniform_huber_residual_correction_scores_jax,
                               fit_uniform_residual_correction_scores_jax,
@@ -41,26 +44,9 @@ def make_direct_model(
     session_correction: np.ndarray,*,base_texture: np.ndarray | None = None,
     decoder_bias: np.ndarray | None = None,
 ) -> LightFieldModel:
-    descriptor_rows=4
-    descriptor_count=6+10*descriptor_rows
-    return LightFieldModel.direct_fit(
-        session_correction,
-        base_texture=(np.full((7,5,3),.5,np.float32)
-                      if base_texture is None else base_texture),
-        coordinate_frequencies=np.asarray([1.],np.float32),
-        geometry_feature_mean=np.zeros(descriptor_count,np.float32),
-        geometry_feature_scale=np.ones(descriptor_count,np.float32),
-        geometry_pca_components=np.zeros((descriptor_count,2),np.float32),
-        geometry_pca_scale=np.ones(2,np.float32),
-        local_geometry_feature_mean=np.zeros(15,np.float32),
-        local_geometry_feature_scale=np.ones(15,np.float32),
-        geometry_encoder_weights=(
-            np.zeros((descriptor_count,2),np.float32),),
-        geometry_encoder_biases=(np.zeros(2,np.float32),),
-        decoder_weights=(np.zeros((25,3),np.float32),),
-        decoder_biases=((np.asarray([-.5,-1.,-1.5],np.float32)
-                         if decoder_bias is None else decoder_bias),),
-        geometry_descriptor_rows=descriptor_rows)
+    return make_direct_3_model(
+        session_correction,base_texture=base_texture,
+        decoder_bias=decoder_bias)
 
 
 def make_direct_3_model(
@@ -80,15 +66,82 @@ def make_direct_3_model(
         geometry_feature_scale=np.ones(descriptor_count,np.float32),
         geometry_pca_components=np.zeros((descriptor_count,2),np.float32),
         geometry_pca_scale=np.ones(2,np.float32),
-        local_geometry_feature_mean=np.zeros(15,np.float32),
-        local_geometry_feature_scale=np.ones(15,np.float32),
+        local_geometry_feature_mean=np.zeros(10,np.float32),
+        local_geometry_feature_scale=np.ones(10,np.float32),
         geometry_encoder_weights=(
             np.zeros((descriptor_count,2),np.float32),),
         geometry_encoder_biases=(np.zeros(2,np.float32),),
         channel_decoder_weights=tuple(
-            (np.zeros((25,1),np.float32),) for _ in range(3)),
+            (np.zeros((20,1),np.float32),) for _ in range(3)),
         channel_decoder_biases=tuple(
             (np.asarray([bias],np.float32),) for bias in biases),
+        geometry_descriptor_rows=descriptor_rows)
+
+
+def make_direct_3_custom(
+    *,feature_mean: np.ndarray,feature_scale: np.ndarray,
+    pca_components: np.ndarray,encoder_weights: tuple[np.ndarray,...],
+    encoder_biases: tuple[np.ndarray,...],
+    decoder_weights: tuple[np.ndarray,...],
+    decoder_biases: tuple[np.ndarray,...],
+    base_texture: np.ndarray,
+) -> LightFieldModel:
+    """把旧测试中的共享三通道权重拆为 direct_fit_3 三个标量 decoder。"""
+    channel_weights=[]; channel_biases=[]
+    for channel in range(3):
+        channel_weights.append(tuple(
+            weight if index<len(decoder_weights)-1 else weight[:,channel:channel+1]
+            for index,weight in enumerate(decoder_weights)))
+        channel_biases.append(tuple(
+            bias if index<len(decoder_biases)-1 else bias[channel:channel+1]
+            for index,bias in enumerate(decoder_biases)))
+    return LightFieldModel.direct_fit_3(
+        np.zeros((3,4,4),np.float32),base_texture=base_texture,
+        coordinate_frequencies=np.asarray([1.],np.float32),
+        geometry_feature_mean=feature_mean,
+        geometry_feature_scale=feature_scale,
+        geometry_pca_components=pca_components,
+        geometry_pca_scale=np.ones(pca_components.shape[1],np.float32),
+        local_geometry_feature_mean=np.zeros(10,np.float32),
+        local_geometry_feature_scale=np.ones(10,np.float32),
+        geometry_encoder_weights=encoder_weights,
+        geometry_encoder_biases=encoder_biases,
+        channel_decoder_weights=tuple(channel_weights),
+        channel_decoder_biases=tuple(channel_biases),
+        geometry_descriptor_rows=4)
+
+
+def make_direct_s_model() -> LightFieldModel:
+    descriptor_rows=4
+    descriptor_count=6+10*descriptor_rows
+    frequencies=np.asarray([1.],np.float32)
+    latent=3; pca=2; hidden=4
+    color_input=2+4*frequencies.size+latent+pca+10+hidden
+    return LightFieldModel.direct_fit_s(
+        np.zeros((3,4,4),np.float32),
+        base_texture=np.full((7,5,3),.5,np.float32),
+        coordinate_frequencies=frequencies,
+        geometry_feature_mean=np.zeros(descriptor_count,np.float32),
+        geometry_feature_scale=np.ones(descriptor_count,np.float32),
+        geometry_pca_components=np.zeros((descriptor_count,pca),np.float32),
+        geometry_pca_scale=np.ones(pca,np.float32),
+        local_geometry_feature_mean=np.zeros(10,np.float32),
+        local_geometry_feature_scale=np.ones(10,np.float32),
+        geometry_encoder_weights=(
+            np.zeros((descriptor_count,latent),np.float32),),
+        geometry_encoder_biases=(np.zeros(latent,np.float32),),
+        gru_input_weight=np.zeros((latent,3*hidden),np.float32),
+        gru_recurrent_weight=np.zeros((hidden,3*hidden),np.float32),
+        gru_bias=np.zeros(3*hidden,np.float32),
+        warp_weight=np.zeros((hidden,3),np.float32),
+        warp_bias=np.asarray([-7.,0.,-7.],np.float32),
+        color_trunk_weights=(
+            np.zeros((color_input,6),np.float32),),
+        color_trunk_biases=(np.zeros(6,np.float32),),
+        channel_head_weights=tuple(
+            (np.zeros((6+color_input,1),np.float32),) for _ in range(3)),
+        channel_head_biases=tuple(
+            (np.zeros(1,np.float32),) for _ in range(3)),
         geometry_descriptor_rows=descriptor_rows)
 
 class LightFieldTest(unittest.TestCase):
@@ -146,7 +199,7 @@ class LightFieldTest(unittest.TestCase):
             raw["format_version"]=15
             raw.pop("direct_reconstruction_pipeline",None)
             path.write_text(yaml.safe_dump(raw),encoding="utf-8")
-            with self.assertRaisesRegex(ValueError,"完整实时 JAX"):
+            with self.assertRaisesRegex(ValueError,"版本已经过期"):
                 LightFieldModel.load(path)
 
     def test_v16_direct_model_is_rejected_as_pre_base_delta_split(self):
@@ -157,7 +210,7 @@ class LightFieldTest(unittest.TestCase):
             raw=yaml.safe_load(path.read_text(encoding="utf-8"))
             raw["format_version"]=16
             path.write_text(yaml.safe_dump(raw),encoding="utf-8")
-            with self.assertRaisesRegex(ValueError,"静态 B 与几何 delta B"):
+            with self.assertRaisesRegex(ValueError,"版本已经过期"):
                 LightFieldModel.load(path)
 
     def test_gpu_canonical_residual_sampling_preserves_saturated_linear_grid(self):
@@ -302,7 +355,7 @@ class LightFieldTest(unittest.TestCase):
             path=Path(directory)/"model.yaml"
             model.save(path)
             raw=yaml.safe_load(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["format_version"],17)
+            self.assertEqual(raw["format_version"],22)
             self.assertEqual(raw["background_method"],"physical_residual")
             self.assertEqual(raw["delta_axes"],["x","normal"])
             np.testing.assert_allclose(np.asarray(raw["scatter_ratio"]),np.ones(4)*.5)
@@ -324,41 +377,15 @@ class LightFieldTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"版本已经过期"):
                 LightFieldModel.load(path)
 
-    def test_direct_fit_model_round_trip_omits_physical_parameters(self):
-        b=np.zeros((3,8,4),np.float32)
-        model=make_direct_model(b)
+    def test_removed_direct_fit_model_version_is_rejected(self):
+        self.assertFalse(hasattr(LightFieldModel,"direct_fit"))
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"direct.yaml"
-            model.save(path)
-            raw=yaml.safe_load(path.read_text(encoding="utf-8"))
-            loaded=LightFieldModel.load(path)
-        self.assertEqual(raw["format_version"],18)
-        self.assertEqual(raw["background_method"],"direct_fit")
-        self.assertEqual(
-            raw["residual_correction_mode"],
-            "static_base_plus_geometry_delta_plus_additive_session")
-        self.assertEqual(raw["base_coefficient_mode"],"direct_static_texture")
-        self.assertEqual(raw["direct_session_correction_mode"],"additive_bspline")
-        self.assertEqual(raw["direct_base_mode"],"robust_full_resolution_texture")
-        self.assertEqual(raw["direct_delta_mode"],"additive_logit")
-        self.assertEqual(np.asarray(raw["direct_base_texture"]).shape,(7,5,3))
-        self.assertEqual(raw["direct_decoder_skip_mode"],"input_every_layer")
-        self.assertEqual(
-            raw["direct_reconstruction_pipeline"],"jax_surface_from_masks_v1")
-        self.assertEqual(np.asarray(
-            raw["direct_geometry_pca_components"]).shape,(46,2))
-        self.assertNotIn("delta_mm",raw)
-        self.assertNotIn("bspline_coefficients",raw)
-        self.assertNotIn("residual_m_bspline_coefficients",raw)
-        self.assertEqual(loaded.background_method,"direct_fit")
-        np.testing.assert_array_equal(np.asarray(loaded.residual_b_coefficients),b)
-        self.assertEqual(loaded.residual_m_coefficients.shape,(0,3,8,4))
-        expected=1/(1+np.exp(-np.asarray([-.5,-1.,-1.5])))
-        y,x=np.meshgrid(np.arange(6.),np.arange(3.),indexing="ij")
-        xyz=np.stack([x,y,np.ones_like(x)*100],axis=-1).astype(np.float32)
-        np.testing.assert_allclose(
-            np.asarray(direct_background_field_jax((7,5),xyz,loaded)),
-            np.broadcast_to(expected,(7,5,3)),atol=1e-6)
+            path.write_text(yaml.safe_dump({
+                "format_version":23,"background_method":"direct_fit"}),
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,"版本已经过期"):
+                LightFieldModel.load(path)
 
     def test_direct_fit_3_round_trip_uses_independent_scalar_decoders(self):
         b=np.zeros((3,8,4),np.float32)
@@ -372,7 +399,7 @@ class LightFieldTest(unittest.TestCase):
             model.save(path)
             raw=yaml.safe_load(path.read_text(encoding="utf-8"))
             loaded=LightFieldModel.load(path)
-        self.assertEqual(raw["format_version"],19)
+            self.assertEqual(raw["format_version"],25)
         self.assertEqual(raw["background_method"],"direct_fit_3")
         self.assertEqual(raw["direct_base_channel_mode"],"independent_huber")
         self.assertEqual(raw["direct_channel_decoder_order"],["R","G","B"])
@@ -381,7 +408,7 @@ class LightFieldTest(unittest.TestCase):
         self.assertNotIn("direct_decoder_weights",raw)
         self.assertEqual(len(raw["direct_channel_decoder_weights"]),3)
         self.assertEqual(loaded.background_method,"direct_fit_3")
-        self.assertIsNone(loaded.direct_decoder_weights)
+        self.assertFalse(hasattr(loaded,"direct_decoder_weights"))
         self.assertEqual(len(loaded.direct_channel_decoder_weights),3)
         y,x=np.meshgrid(np.arange(6.),np.arange(3.),indexing="ij")
         xyz=np.stack([x,y,np.ones_like(x)*100],axis=-1).astype(np.float32)
@@ -392,43 +419,25 @@ class LightFieldTest(unittest.TestCase):
             np.asarray(direct_background_field_jax((7,5),xyz,loaded)),
             np.broadcast_to(expected,(7,5,3)),atol=1e-6)
 
-    def test_geometry_cache_round_trip_and_anchor_interpolation(self):
-        curve_coefficients=4
-        descriptor_count=4*curve_coefficients
-        anchors=np.zeros((2,3,4,4),np.float32)
-        anchors[1,2]=.1
-        descriptor_mean=np.zeros(descriptor_count,np.float32)
-        descriptor_scale=np.ones(descriptor_count,np.float32)
-        pca_components=np.zeros((descriptor_count,1),np.float32)
-        # 第一个中心线 Z 控制点决定此合成测试的一维几何键。
-        pca_components[2,0]=1
-        model=LightFieldModel.geometry_cache(
-            np.zeros((3,4,4),np.float32),
-            base_texture=np.full((7,5,3),.4,np.float32),
-            anchor_coefficients=anchors,
-            descriptor_mean=descriptor_mean,descriptor_scale=descriptor_scale,
-            pca_components=pca_components,pca_scale=np.ones(1,np.float32),
-            anchor_keys=np.asarray([[100.],[110.]],np.float32),
-            curve_coefficients=curve_coefficients,
-            interpolation_neighbors=2,distance_epsilon=1e-4)
-        y,x=np.meshgrid(np.arange(6.),np.arange(3.),indexing="ij")
-        xyz=np.stack([x,y,np.ones_like(x)*105],axis=-1).astype(np.float32)
-        expected=np.full((7,5,3),.4,np.float32); expected[...,2]=.45
-        np.testing.assert_allclose(np.asarray(
-            geometry_cache_background_field_jax((7,5),xyz,model)),
-            expected,atol=2e-4)
+    def test_direct_fit_s_round_trip_and_affine_s_warp(self):
+        model=make_direct_s_model()
         with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/"cache.yaml"
+            path=Path(directory)/"direct_s.yaml"
             model.save(path)
             raw=yaml.safe_load(path.read_text(encoding="utf-8"))
             loaded=LightFieldModel.load(path)
-        self.assertEqual(raw["format_version"],21)
-        self.assertEqual(raw["background_method"],"geometry_cache")
-        self.assertEqual(
-            raw["geometry_cache_mode"],
-            "nearest_anchor_convex_interpolation")
-        self.assertEqual(loaded.geometry_cache_anchor_coefficients.shape,
-                         (2,3,4,4))
+        self.assertEqual(raw["format_version"],26)
+        self.assertEqual(raw["direct_warp_mode"],
+                         "affine_s_softmax_interval")
+        y,x=np.meshgrid(np.arange(6.),np.arange(3.),indexing="ij")
+        xyz=np.stack([x,y,np.ones_like(x)*100],axis=-1).astype(np.float32)
+        hidden,interval,_,_=direct_s_recurrent_step_jax(
+            xyz,jnp.zeros((4,),jnp.float32),loaded)
+        self.assertAlmostEqual(float(np.asarray(interval).sum()),1.,places=6)
+        self.assertGreater(float(interval[1]),.99)
+        field=np.asarray(direct_s_background_field_jax(
+            (7,5),xyz,xyz,hidden,interval,loaded))
+        np.testing.assert_allclose(field,.5,atol=1e-6)
 
     def test_direct_neural_field_changes_with_global_geometry(self):
         descriptor_rows=4; descriptor_count=6+10*descriptor_rows
@@ -436,24 +445,18 @@ class LightFieldTest(unittest.TestCase):
         feature_mean[2]=100
         encoder_weight=np.zeros((descriptor_count,1),np.float32)
         encoder_weight[2,0]=1
-        decoder_weight=np.zeros((24,3),np.float32)
+        decoder_weight=np.zeros((19,3),np.float32)
         decoder_weight[6]=np.asarray([1.,-.5,.25],np.float32)
-        model=LightFieldModel.direct_fit(
-            np.zeros((3,4,4),np.float32),
+        model=make_direct_3_custom(
             base_texture=np.full((7,5,3),.5,np.float32),
-            coordinate_frequencies=np.asarray([1.],np.float32),
-            geometry_feature_mean=feature_mean,
-            geometry_feature_scale=np.ones(descriptor_count,np.float32),
-            geometry_pca_components=np.zeros(
+            feature_mean=feature_mean,
+            feature_scale=np.ones(descriptor_count,np.float32),
+            pca_components=np.zeros(
                 (descriptor_count,2),np.float32),
-            geometry_pca_scale=np.ones(2,np.float32),
-            local_geometry_feature_mean=np.zeros(15,np.float32),
-            local_geometry_feature_scale=np.ones(15,np.float32),
-            geometry_encoder_weights=(encoder_weight,),
-            geometry_encoder_biases=(np.zeros(1,np.float32),),
+            encoder_weights=(encoder_weight,),
+            encoder_biases=(np.zeros(1,np.float32),),
             decoder_weights=(decoder_weight,),
-            decoder_biases=(np.zeros(3,np.float32),),
-            geometry_descriptor_rows=descriptor_rows)
+            decoder_biases=(np.zeros(3,np.float32),))
         y,x=np.meshgrid(np.arange(8.),np.arange(5.),indexing="ij")
         first=np.stack([x,y,np.ones_like(x)*99],axis=-1).astype(np.float32)
         second=first.copy(); second[...,2]=101
@@ -462,30 +465,34 @@ class LightFieldTest(unittest.TestCase):
         self.assertGreater(float(np.max(np.abs(a-b))),.1)
         self.assertEqual(direct_geometry_descriptor_jax(first,4).ndim,1)
 
+    def test_direct_local_geometry_features_exclude_structural_zero_axes(self):
+        y,x=np.meshgrid(
+            np.linspace(0,1,8),np.linspace(-1,1,5),indexing="ij")
+        xyz=np.stack([x,y,100+.2*y*y],axis=-1).astype(np.float32)
+        features=np.asarray(direct_local_geometry_feature_grid_jax(xyz))
+        self.assertEqual(features.shape,(8,5,10))
+        self.assertTrue(np.isfinite(features).all())
+        # 最后一维是唯一非零的截面横向偏移 X-Xcenter。
+        np.testing.assert_allclose(features[...,9],x,atol=1e-6)
+
     def test_direct_neural_field_has_deterministic_pca_geometry_skip(self):
         descriptor_rows=4; descriptor_count=6+10*descriptor_rows
         feature_mean=np.zeros(descriptor_count,np.float32); feature_mean[2]=100
         pca_components=np.zeros((descriptor_count,2),np.float32)
         pca_components[2,0]=1
-        decoder_weight=np.zeros((24,3),np.float32)
+        decoder_weight=np.zeros((19,3),np.float32)
         # 6 维坐标和 1 维学习 latent 之后是 PCA 直连。
         decoder_weight[7,0]=1
-        model=LightFieldModel.direct_fit(
-            np.zeros((3,4,4),np.float32),
+        model=make_direct_3_custom(
             base_texture=np.full((7,5,3),.5,np.float32),
-            coordinate_frequencies=np.asarray([1.],np.float32),
-            geometry_feature_mean=feature_mean,
-            geometry_feature_scale=np.ones(descriptor_count,np.float32),
-            geometry_pca_components=pca_components,
-            geometry_pca_scale=np.ones(2,np.float32),
-            local_geometry_feature_mean=np.zeros(15,np.float32),
-            local_geometry_feature_scale=np.ones(15,np.float32),
-            geometry_encoder_weights=(
+            feature_mean=feature_mean,
+            feature_scale=np.ones(descriptor_count,np.float32),
+            pca_components=pca_components,
+            encoder_weights=(
                 np.zeros((descriptor_count,1),np.float32),),
-            geometry_encoder_biases=(np.zeros(1,np.float32),),
+            encoder_biases=(np.zeros(1,np.float32),),
             decoder_weights=(decoder_weight,),
-            decoder_biases=(np.zeros(3,np.float32),),
-            geometry_descriptor_rows=descriptor_rows)
+            decoder_biases=(np.zeros(3,np.float32),))
         y,x=np.meshgrid(np.arange(8.),np.arange(5.),indexing="ij")
         first=np.stack([x,y,np.ones_like(x)*99],axis=-1).astype(np.float32)
         second=first.copy(); second[...,2]=101
@@ -495,27 +502,21 @@ class LightFieldTest(unittest.TestCase):
 
     def test_direct_neural_field_uses_local_geometry_through_dense_skip(self):
         descriptor_rows=4; descriptor_count=6+10*descriptor_rows
-        first_weight=np.zeros((24,2),np.float32)
-        output_weight=np.zeros((26,3),np.float32)
-        # 完整条件为 [6 坐标, 1 latent, 2 PCA, 15 局部]；索引 11 是局部 z。
+        first_weight=np.zeros((19,2),np.float32)
+        output_weight=np.zeros((21,3),np.float32)
+        # 完整条件为 [6 坐标, 1 latent, 2 PCA, 10 局部]；索引 11 是局部 z。
         output_weight[2+11,0]=4
-        model=LightFieldModel.direct_fit(
-            np.zeros((3,4,4),np.float32),
+        model=make_direct_3_custom(
             base_texture=np.full((8,5,3),.5,np.float32),
-            coordinate_frequencies=np.asarray([1.],np.float32),
-            geometry_feature_mean=np.zeros(descriptor_count,np.float32),
-            geometry_feature_scale=np.ones(descriptor_count,np.float32),
-            geometry_pca_components=np.zeros(
+            feature_mean=np.zeros(descriptor_count,np.float32),
+            feature_scale=np.ones(descriptor_count,np.float32),
+            pca_components=np.zeros(
                 (descriptor_count,2),np.float32),
-            geometry_pca_scale=np.ones(2,np.float32),
-            local_geometry_feature_mean=np.zeros(15,np.float32),
-            local_geometry_feature_scale=np.ones(15,np.float32),
-            geometry_encoder_weights=(
+            encoder_weights=(
                 np.zeros((descriptor_count,1),np.float32),),
-            geometry_encoder_biases=(np.zeros(1,np.float32),),
+            encoder_biases=(np.zeros(1,np.float32),),
             decoder_weights=(first_weight,output_weight),
-            decoder_biases=(np.zeros(2,np.float32),np.zeros(3,np.float32)),
-            geometry_descriptor_rows=descriptor_rows)
+            decoder_biases=(np.zeros(2,np.float32),np.zeros(3,np.float32)))
         y,x=np.meshgrid(
             np.linspace(0,1,8),np.linspace(0,1,5),indexing="ij")
         xyz=np.stack([x,y,.3*y*y],axis=-1).astype(np.float32)
@@ -565,8 +566,9 @@ class LightFieldTest(unittest.TestCase):
                 base_huber_iterations=2,
                 spatial_difference_points_per_frame=96,
                 geometry_difference_neighbor_count=3,
-                geometry_difference_points_per_pair=96,seed=3))
-        model=LightFieldModel.direct_fit(
+                geometry_difference_points_per_pair=96,seed=3,
+                separate_channel_decoders=True))
+        model=LightFieldModel.direct_fit_3(
             np.zeros((3,4,4),np.float32),
             base_texture=base_texture,
             coordinate_frequencies=frequencies,
@@ -578,7 +580,8 @@ class LightFieldTest(unittest.TestCase):
             local_geometry_feature_scale=local_scale,
             geometry_encoder_weights=encoder_weights,
             geometry_encoder_biases=encoder_biases,
-            decoder_weights=decoder_weights,decoder_biases=decoder_biases,
+            channel_decoder_weights=decoder_weights,
+            channel_decoder_biases=decoder_biases,
             geometry_descriptor_rows=4)
         prediction=np.stack([np.asarray(direct_background_field_jax(
             (rows,columns),surface,model)) for surface in surfaces])
@@ -630,7 +633,7 @@ class LightFieldTest(unittest.TestCase):
                 early_stopping_patience=5,early_stopping_min_steps=0,
                 separate_channel_decoders=True)
             with np.load(checkpoint,allow_pickle=False) as saved:
-                self.assertEqual(int(saved["checkpoint_format_version"]),4)
+                self.assertEqual(int(saved["checkpoint_format_version"]),5)
                 self.assertEqual(int(saved["channel_decoder_count"]),3)
                 self.assertIn("decoder_2_weight_1",saved.files)
         (*common,encoder_weights,encoder_biases,
@@ -761,6 +764,10 @@ class LightFieldTest(unittest.TestCase):
         self.assertLess(
             float(np.sqrt(np.mean((residuals-reconstructed)**2))),.012)
 
+    @unittest.skipUnless(
+        any(device.platform=="gpu" for device in jax.devices()),
+        "需要可用的 JAX GPU",
+    )
     def test_startup_model_reparameterizes_raw_ms_against_bsession(self):
         count,rows,columns=10,24,18
         y,x=np.meshgrid(np.linspace(-1,1,rows),np.linspace(-1,1,columns),indexing="ij")
@@ -805,6 +812,10 @@ class LightFieldTest(unittest.TestCase):
         self.assertTrue(np.all(
             diagnostics["bsession_m_rmse_rgb"]<diagnostics["bsession_rmse_rgb"]))
 
+    @unittest.skipUnless(
+        any(device.platform=="gpu" for device in jax.devices()),
+        "需要可用的 JAX GPU",
+    )
     def test_startup_orthogonalization_removes_collinear_bsession_from_m(self):
         count,rows,columns=6,20,14
         y,x=np.meshgrid(
@@ -868,6 +879,10 @@ class LightFieldTest(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(robust),np.full((3,1),.1+.05/3),atol=2e-3)
 
+    @unittest.skipUnless(
+        any(device.platform=="gpu" for device in jax.devices()),
+        "需要可用的 JAX GPU",
+    )
     def test_direct_startup_fits_only_additive_session(self):
         count,rows,columns=6,18,12
         y,x=np.meshgrid(

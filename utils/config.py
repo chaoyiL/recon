@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from copy import deepcopy
 from numbers import Real
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,11 +12,12 @@ from typing import Any, Mapping
 import numpy as np
 import yaml
 
-BACKGROUND_METHODS = (
-    "physical_residual","direct_fit","direct_fit_3","geometry_cache")
-DIRECT_BACKGROUND_METHODS = ("direct_fit","direct_fit_3")
-GEOMETRY_BACKGROUND_METHODS = (
-    "direct_fit","direct_fit_3","geometry_cache")
+from utils.material_surface import (
+    MaterialSurfaceTemplate,camera_calibration_sha256,
+    material_reconstruction_sha256)
+
+BACKGROUND_METHODS = ("physical_residual","direct_fit_3","direct_fit_s")
+DIRECT_BACKGROUND_METHODS = ("direct_fit_3","direct_fit_s")
 
 
 class ConfigError(ValueError):
@@ -32,7 +34,7 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
-class DirectFitConfig:
+class DirectFit3Config:
     coordinate_frequencies: tuple[float,...]
     geometry_descriptor_rows: int
     geometry_encoder_width: int
@@ -48,10 +50,8 @@ class DirectFitConfig:
     base_huber_iterations: int
     adaptive_channel_weight_strength: float
     spatial_difference_weight: float
-    spatial_difference_validation_weight: float
     spatial_difference_points_per_frame: int
     geometry_difference_weight: float
-    geometry_difference_validation_weight: float
     geometry_difference_neighbor_count: int
     geometry_difference_points_per_pair: int
     validation_interval: int
@@ -60,27 +60,66 @@ class DirectFitConfig:
     early_stopping_patience: int
     early_stopping_min_steps: int
     early_stopping_min_delta: float
-    sample_saturation_threshold: int
     sample_erode_pixels: int
     session_correction_max_deviation: float
 
 
 @dataclass(frozen=True)
-class GeometryCacheConfig:
-    descriptor_curve_coefficients: int
-    descriptor_pca_dimensions: int
-    descriptor_huber_delta_mm: float
-    anchor_count: int
-    anchor_neighbor_count: int
-    interpolation_neighbor_count: int
-    interpolation_distance_power: float
-    interpolation_distance_epsilon: float
-    background_huber_delta: float
-    background_huber_iterations: int
-    fit_batch_size: int
-    sample_saturation_threshold: int
+class DirectFitSConfig:
+    coordinate_frequencies: tuple[float,...]
+    geometry_descriptor_rows: int
+    geometry_encoder_width: int
+    geometry_encoder_layers: int
+    geometry_latent_dimensions: int
+    geometry_pca_dimensions: int
+    gru_hidden_dimensions: int
+    color_trunk_width: int
+    color_trunk_layers: int
+    color_head_width: int
+    color_head_layers: int
+    color_pretrain_steps: int
+    warp_train_steps: int
+    joint_finetune_steps: int
+    clip_length: int
+    clip_batch_size: int
+    points_per_frame: int
+    trusted_clip_fraction: float
+    color_pretrain_learning_rate: float
+    warp_learning_rate: float
+    joint_learning_rate: float
+    gradient_clip_norm: float
+    adam_beta1: float
+    adam_beta2: float
+    adam_epsilon: float
+    warp_identity_epsilon: float
+    base_huber_iterations: int
+    base_frame_batch_size: int
+    identity_weight: float
+    temporal_weight: float
+    cycle_weight: float
+    minimum_crop_weight: float
+    cycles_per_video: int
+    cycle_sample_frames: int
+    cycle_endpoint_frames: int
+    maximum_sequence_gap: int
     sample_erode_pixels: int
     session_correction_max_deviation: float
+    online_gain_bias_enabled: bool
+
+
+@dataclass(frozen=True)
+class MaterialSurfaceConfig:
+    width_mm: float
+    length_mm: float
+    s_zero_endpoint: str
+    initial_calibration_maximum_rms_px: float
+    calibration_maximum_rms_px: float
+    calibration_minimum_confidence: float
+    match_confidence_scale_mm: float
+    rms_confidence_scale_px: float
+    confidence_floor: float
+    visibility_depth_tolerance_mm: float
+    bend_direction: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +132,7 @@ class ReconstructionConfig:
     show_point_cloud: bool
     pair_fill_count: int
     sample_count: int
+    side_edge_exclusion_ratio: float
     uv_boundary_smooth_lambda: float
     uv_boundary_huber_delta_px: float
     curve_convexity: str
@@ -104,6 +144,7 @@ class ReconstructionConfig:
     residual_coefficient_columns: int
     residual_texture_rows: int
     residual_texture_columns: int
+    material_surface: MaterialSurfaceConfig
 
     @property
     def K(self) -> np.ndarray:
@@ -117,23 +158,81 @@ class ReconstructionConfig:
     def geometry_columns(self) -> int:
         return self.pair_fill_count+2
 
+    @property
+    def material_template(self) -> MaterialSurfaceTemplate:
+        """按当前尺寸和重建语义确定性生成材料模板。"""
+        material=self.material_surface
+        return MaterialSurfaceTemplate(
+            width_mm=material.width_mm,
+            length_mm=material.length_mm,
+            rows=self.geometry_rows,
+            columns=self.geometry_columns,
+            s_zero_endpoint=material.s_zero_endpoint,
+            camera_sha256=camera_calibration_sha256(
+                self.K,self.distortion_coefficients),
+            reconstruction_sha256=material_reconstruction_sha256(
+                s1=self.s1,s2=self.s2,
+                geometry_rows=self.geometry_rows,
+                geometry_columns=self.geometry_columns,
+                bend_direction=material.bend_direction,
+                uv_boundary_smooth_lambda=self.uv_boundary_smooth_lambda,
+                uv_boundary_huber_delta_px=self.uv_boundary_huber_delta_px,
+                side_edge_exclusion_ratio=self.side_edge_exclusion_ratio),
+        )
+
+
+def _merge_config_mappings(
+    base: Mapping[str,Any], override: Mapping[str,Any],
+) -> dict[str,Any]:
+    """递归合并配置映射；子配置中的标量、列表和 null 直接覆盖父配置。"""
+    result=deepcopy(dict(base))
+    for key,value in override.items():
+        if key=="extends":
+            continue
+        current=result.get(key)
+        if isinstance(current,Mapping) and isinstance(value,Mapping):
+            result[key]=_merge_config_mappings(current,value)
+        else:
+            result[key]=deepcopy(value)
+    return result
+
+
+def load_config(config_path: str | Path) -> dict[str,Any]:
+    """读取 YAML；可用顶层 ``extends`` 继承同目录或绝对路径的基础配置。"""
+    def load_one(path: Path,stack: tuple[Path,...]) -> dict[str,Any]:
+        resolved=path.expanduser().resolve()
+        if resolved in stack:
+            chain=" -> ".join(str(item) for item in (*stack,resolved))
+            raise ConfigError(f"配置 extends 存在循环: {chain}")
+        try:
+            with resolved.open("r",encoding="utf-8") as config_file:
+                config=yaml.safe_load(config_file)
+        except FileNotFoundError as error:
+            raise ConfigError(f"配置文件不存在: {resolved}") from error
+        except yaml.YAMLError as error:
+            raise ConfigError(f"配置文件格式错误: {error}") from error
+        if not isinstance(config,Mapping):
+            raise ConfigError("配置文件根节点必须是字典")
+        parent=config.get("extends")
+        if parent is None:
+            return deepcopy(dict(config))
+        if not isinstance(parent,str) or not parent.strip():
+            raise ConfigError("顶层 extends 必须是非空路径字符串")
+        parent_path=Path(parent).expanduser()
+        if not parent_path.is_absolute():
+            parent_path=resolved.parent/parent_path
+        inherited=load_one(parent_path,(*stack,resolved))
+        return _merge_config_mappings(inherited,config)
+
+    return load_one(Path(config_path),())
+
 
 def load_config_sections(
     config_path: str | Path,
     *section_names: str,
 ) -> tuple[dict[str, Any], ...]:
     """加载指定配置段，并拒绝缺失或非字典配置。"""
-    path = Path(config_path).expanduser()
-    try:
-        with path.open("r", encoding="utf-8") as config_file:
-            config = yaml.safe_load(config_file)
-    except FileNotFoundError as error:
-        raise ConfigError(f"配置文件不存在: {path}") from error
-    except yaml.YAMLError as error:
-        raise ConfigError(f"配置文件格式错误: {error}") from error
-
-    if not isinstance(config, Mapping):
-        raise ConfigError("配置文件根节点必须是字典")
+    config=load_config(config_path)
 
     sections: list[dict[str, Any]] = []
     for section_name in section_names:
@@ -164,17 +263,14 @@ def parse_background_method(lightfield: Mapping[str,Any]) -> str:
     method=background.get("method","physical_residual")
     if method not in BACKGROUND_METHODS:
         raise ConfigError(
-            "lightfield.background.method 必须是 physical_residual、direct_fit、"
-            "direct_fit_3 或 geometry_cache")
+            "lightfield.background.method 必须是 physical_residual、"
+            "direct_fit_3 或 direct_fit_s")
     return str(method)
 
 
-def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
-    """读取 direct 几何条件神经场和低频会话修正配置。"""
-    configured_method=parse_background_method(lightfield)
-    section_name=("direct_fit_3"
-                  if configured_method=="direct_fit_3"
-                  and "direct_fit_3" in lightfield else "direct_fit")
+def parse_direct_fit_3_config(lightfield: Mapping[str,Any]) -> DirectFit3Config:
+    """读取 direct_fit_3 几何条件神经场和低频会话修正配置。"""
+    section_name="direct_fit_3"
     direct=lightfield.get(section_name,{})
     if not isinstance(direct,Mapping):
         raise ConfigError(f"lightfield.{section_name} 必须是字典")
@@ -194,10 +290,8 @@ def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
         "frame_batch_size","learning_rate",
         "base_huber_iterations","adaptive_channel_weight_strength",
         "spatial_difference_weight",
-        "spatial_difference_validation_weight",
         "spatial_difference_points_per_frame",
         "geometry_difference_weight","geometry_difference_neighbor_count",
-        "geometry_difference_validation_weight",
         "geometry_difference_points_per_pair",
         "validation_interval","validation_frame_count",
         "validation_points_per_frame","early_stopping_patience",
@@ -208,7 +302,7 @@ def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
     sample_filter=direct.get("sample_filter",{})
     if not isinstance(sample_filter,Mapping):
         raise ConfigError(f"{section_name}.sample_filter 必须是字典")
-    sample_unknown=set(sample_filter)-{"saturation_threshold","erode_pixels"}
+    sample_unknown=set(sample_filter)-{"erode_pixels"}
     if sample_unknown:
         raise ConfigError(
             f"{section_name}.sample_filter 包含未知字段: {sorted(sample_unknown)}")
@@ -240,12 +334,7 @@ def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
 
     session_max=number(
         direct,"session_correction_max_deviation",.15)
-    saturation_threshold=integer(
-        sample_filter,"saturation_threshold",255)
-    if saturation_threshold>255:
-        raise ConfigError(
-            f"{section_name}.sample_filter.saturation_threshold 必须不大于 255")
-    result=DirectFitConfig(
+    result=DirectFit3Config(
         coordinate_frequencies=tuple(float(value) for value in frequencies),
         geometry_descriptor_rows=integer(
             field,"geometry_descriptor_rows",24,minimum=4),
@@ -269,16 +358,10 @@ def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
             field,"adaptive_channel_weight_strength",0.,allow_zero=True),
         spatial_difference_weight=number(
             field,"spatial_difference_weight",1.,allow_zero=True),
-        spatial_difference_validation_weight=number(
-            field,"spatial_difference_validation_weight",1.,
-            allow_zero=True),
         spatial_difference_points_per_frame=integer(
             field,"spatial_difference_points_per_frame",1024),
         geometry_difference_weight=number(
             field,"geometry_difference_weight",.25,allow_zero=True),
-        geometry_difference_validation_weight=number(
-            field,"geometry_difference_validation_weight",.25,
-            allow_zero=True),
         geometry_difference_neighbor_count=integer(
             field,"geometry_difference_neighbor_count",16),
         geometry_difference_points_per_pair=integer(
@@ -293,7 +376,6 @@ def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
             field,"early_stopping_min_steps",1500,minimum=0),
         early_stopping_min_delta=number(
             field,"early_stopping_min_delta",5e-5,allow_zero=True),
-        sample_saturation_threshold=saturation_threshold,
         sample_erode_pixels=integer(
             sample_filter,"erode_pixels",2,minimum=0),
         session_correction_max_deviation=session_max)
@@ -306,88 +388,164 @@ def parse_direct_fit_config(lightfield: Mapping[str,Any]) -> DirectFitConfig:
     return result
 
 
-def parse_geometry_cache_config(
-    lightfield: Mapping[str,Any],
-) -> GeometryCacheConfig:
-    """读取几何背景锚点缓存、鲁棒聚合和最近邻插值配置。"""
-    section=lightfield.get("geometry_cache",{})
-    if not isinstance(section,Mapping):
-        raise ConfigError("lightfield.geometry_cache 必须是字典")
-    unknown=set(section)-{
-        "descriptor","anchors","sample_filter",
-        "session_correction_max_deviation"}
+def parse_direct_fit_s_config(lightfield: Mapping[str,Any]) -> DirectFitSConfig:
+    """读取带 s 仿射 warp 和序列 GRU 的最小 direct_fit_s 配置。"""
+    section_name="direct_fit_s"
+    direct=lightfield.get(section_name,{})
+    if not isinstance(direct,Mapping):
+        raise ConfigError(f"lightfield.{section_name} 必须是字典")
+    unknown=set(direct)-{
+        "neural_field","training","loss","sequence","sample_filter",
+        "runtime","session_correction_max_deviation"}
     if unknown:
         raise ConfigError(
-            f"lightfield.geometry_cache 包含未知字段: {sorted(unknown)}")
-    descriptor=section.get("descriptor",{})
-    anchors=section.get("anchors",{})
-    sample_filter=section.get("sample_filter",{})
-    for name,value in (("descriptor",descriptor),("anchors",anchors),
-                       ("sample_filter",sample_filter)):
-        if not isinstance(value,Mapping):
-            raise ConfigError(f"lightfield.geometry_cache.{name} 必须是字典")
-    descriptor_unknown=set(descriptor)-{
-        "curve_coefficients","pca_dimensions","huber_delta_mm"}
-    anchor_unknown=set(anchors)-{
-        "count","neighbor_count","interpolation_neighbor_count",
-        "interpolation_distance_power","interpolation_distance_epsilon",
-        "background_huber_delta","background_huber_iterations",
-        "fit_batch_size"}
-    sample_unknown=set(sample_filter)-{"saturation_threshold","erode_pixels"}
-    if descriptor_unknown or anchor_unknown or sample_unknown:
-        unknown_fields=sorted(
-            descriptor_unknown|anchor_unknown|sample_unknown)
-        raise ConfigError(
-            "lightfield.geometry_cache 包含未知字段: "
-            f"{unknown_fields}")
+            f"lightfield.{section_name} 包含未知字段: {sorted(unknown)}")
 
-    def integer(mapping: Mapping[str,Any],name: str,default: int,
-                minimum: int = 1) -> int:
-        value=mapping.get(name,default)
-        if not isinstance(value,int) or isinstance(value,bool) or value<minimum:
-            raise ConfigError(
-                f"geometry_cache.{name} 必须是大于等于 {minimum} 的整数")
+    def mapping(name: str) -> Mapping[str,Any]:
+        value=direct.get(name,{})
+        if not isinstance(value,Mapping):
+            raise ConfigError(f"lightfield.{section_name}.{name} 必须是字典")
         return value
 
-    def number(mapping: Mapping[str,Any],name: str,default: float) -> float:
-        value=mapping.get(name,default)
+    field=mapping("neural_field")
+    training=mapping("training")
+    loss=mapping("loss")
+    sequence=mapping("sequence")
+    sample_filter=mapping("sample_filter")
+    runtime=mapping("runtime")
+    known={
+        "neural_field":{
+            "frequencies","geometry_descriptor_rows",
+            "geometry_encoder_width","geometry_encoder_layers",
+            "geometry_latent_dimensions","geometry_pca_dimensions",
+            "gru_hidden_dimensions","color_trunk_width",
+            "color_trunk_layers","color_head_width","color_head_layers"},
+        "training":{
+            "color_pretrain_steps","warp_train_steps",
+            "joint_finetune_steps","clip_length","clip_batch_size",
+            "points_per_frame","trusted_clip_fraction",
+            "color_pretrain_learning_rate","warp_learning_rate",
+            "joint_learning_rate","gradient_clip_norm",
+            "base_huber_iterations","base_frame_batch_size",
+            "adam_beta1","adam_beta2",
+            "adam_epsilon","warp_identity_epsilon"},
+        "loss":{
+            "identity_weight","temporal_weight","cycle_weight",
+            "minimum_crop_weight"},
+        "sequence":{
+            "cycles_per_video","cycle_sample_frames",
+            "cycle_endpoint_frames","maximum_sequence_gap"},
+        "sample_filter":{"erode_pixels"},
+        "runtime":{"online_gain_bias_enabled"},
+    }
+    for name,value in (("neural_field",field),("training",training),
+                       ("loss",loss),("sequence",sequence),
+                       ("sample_filter",sample_filter),("runtime",runtime)):
+        extra=set(value)-known[name]
+        if extra:
+            raise ConfigError(
+                f"lightfield.{section_name}.{name} 包含未知字段: "
+                f"{sorted(extra)}")
+
+    def integer(section: Mapping[str,Any],name: str,default: int,
+                minimum: int = 1) -> int:
+        value=section.get(name,default)
+        if not isinstance(value,int) or isinstance(value,bool) or value<minimum:
+            raise ConfigError(
+                f"{section_name}.{name} 必须是大于等于 {minimum} 的整数")
+        return int(value)
+
+    def number(section: Mapping[str,Any],name: str,default: float,
+               *,allow_zero: bool = False) -> float:
+        value=section.get(name,default)
         if not isinstance(value,Real) or isinstance(value,bool) \
-                or not np.isfinite(float(value)) or float(value)<=0:
-            raise ConfigError(f"geometry_cache.{name} 必须是有限正数")
+                or not np.isfinite(float(value)) \
+                or (float(value)<0 if allow_zero else float(value)<=0):
+            qualifier="非负" if allow_zero else "正"
+            raise ConfigError(f"{section_name}.{name} 必须是有限{qualifier}数")
         return float(value)
 
-    saturation=integer(sample_filter,"saturation_threshold",255)
-    if saturation>255:
+    frequencies=field.get("frequencies",[1,2,4,8,16,32,64])
+    if not isinstance(frequencies,(list,tuple)) or not frequencies \
+            or any(not isinstance(value,Real) or isinstance(value,bool)
+                   for value in frequencies) \
+            or not np.isfinite(frequencies).all() \
+            or any(float(value)<=0 for value in frequencies):
+        raise ConfigError("direct_fit_s frequencies 必须是非空有限正数列表")
+    trusted_fraction=number(
+        training,"trusted_clip_fraction",.5,allow_zero=True)
+    if trusted_fraction>1:
+        raise ConfigError("direct_fit_s.trusted_clip_fraction 必须位于 [0,1]")
+    online_gain_bias=runtime.get("online_gain_bias_enabled",False)
+    if not isinstance(online_gain_bias,bool):
         raise ConfigError(
-            "geometry_cache.sample_filter.saturation_threshold 必须不大于 255")
-    result=GeometryCacheConfig(
-        descriptor_curve_coefficients=integer(
-            descriptor,"curve_coefficients",12,minimum=4),
-        descriptor_pca_dimensions=integer(
-            descriptor,"pca_dimensions",16),
-        descriptor_huber_delta_mm=number(
-            descriptor,"huber_delta_mm",.5),
-        anchor_count=integer(anchors,"count",48),
-        anchor_neighbor_count=integer(anchors,"neighbor_count",8,minimum=2),
-        interpolation_neighbor_count=integer(
-            anchors,"interpolation_neighbor_count",4),
-        interpolation_distance_power=number(
-            anchors,"interpolation_distance_power",2.),
-        interpolation_distance_epsilon=number(
-            anchors,"interpolation_distance_epsilon",1e-3),
-        background_huber_delta=number(
-            anchors,"background_huber_delta",.04),
-        background_huber_iterations=integer(
-            anchors,"background_huber_iterations",5),
-        fit_batch_size=integer(anchors,"fit_batch_size",4),
-        sample_saturation_threshold=saturation,
+            "direct_fit_s.runtime.online_gain_bias_enabled 必须是布尔值")
+    result=DirectFitSConfig(
+        coordinate_frequencies=tuple(float(value) for value in frequencies),
+        geometry_descriptor_rows=integer(
+            field,"geometry_descriptor_rows",32,minimum=4),
+        geometry_encoder_width=integer(field,"geometry_encoder_width",128),
+        geometry_encoder_layers=integer(field,"geometry_encoder_layers",2),
+        geometry_latent_dimensions=integer(
+            field,"geometry_latent_dimensions",64),
+        geometry_pca_dimensions=integer(field,"geometry_pca_dimensions",32),
+        gru_hidden_dimensions=integer(field,"gru_hidden_dimensions",64),
+        color_trunk_width=integer(field,"color_trunk_width",224),
+        color_trunk_layers=integer(field,"color_trunk_layers",4),
+        color_head_width=integer(field,"color_head_width",128),
+        color_head_layers=integer(field,"color_head_layers",2),
+        color_pretrain_steps=integer(
+            training,"color_pretrain_steps",2500,minimum=0),
+        warp_train_steps=integer(training,"warp_train_steps",2500,minimum=0),
+        joint_finetune_steps=integer(
+            training,"joint_finetune_steps",2500,minimum=0),
+        clip_length=integer(training,"clip_length",16,minimum=2),
+        clip_batch_size=integer(training,"clip_batch_size",2,minimum=2),
+        points_per_frame=integer(training,"points_per_frame",256),
+        trusted_clip_fraction=trusted_fraction,
+        color_pretrain_learning_rate=number(
+            training,"color_pretrain_learning_rate",8e-4),
+        warp_learning_rate=number(training,"warp_learning_rate",4e-4),
+        joint_learning_rate=number(training,"joint_learning_rate",2e-4),
+        gradient_clip_norm=number(training,"gradient_clip_norm",1.),
+        adam_beta1=number(training,"adam_beta1",.9),
+        adam_beta2=number(training,"adam_beta2",.999),
+        adam_epsilon=number(training,"adam_epsilon",1e-8),
+        warp_identity_epsilon=number(
+            training,"warp_identity_epsilon",1e-3),
+        base_huber_iterations=integer(
+            training,"base_huber_iterations",5),
+        base_frame_batch_size=integer(
+            training,"base_frame_batch_size",8),
+        identity_weight=number(loss,"identity_weight",5.,allow_zero=True),
+        temporal_weight=number(loss,"temporal_weight",.25,allow_zero=True),
+        cycle_weight=number(loss,"cycle_weight",1.,allow_zero=True),
+        minimum_crop_weight=number(
+            loss,"minimum_crop_weight",.02,allow_zero=True),
+        cycles_per_video=integer(sequence,"cycles_per_video",1),
+        cycle_sample_frames=integer(
+            sequence,"cycle_sample_frames",32,minimum=2),
+        cycle_endpoint_frames=integer(
+            sequence,"cycle_endpoint_frames",3),
+        maximum_sequence_gap=integer(
+            sequence,"maximum_sequence_gap",1,minimum=1),
         sample_erode_pixels=integer(
             sample_filter,"erode_pixels",4,minimum=0),
         session_correction_max_deviation=number(
-            section,"session_correction_max_deviation",.3))
-    if result.interpolation_neighbor_count>result.anchor_count:
+            direct,"session_correction_max_deviation",.30),
+        online_gain_bias_enabled=online_gain_bias)
+    if result.color_pretrain_steps+result.warp_train_steps \
+            +result.joint_finetune_steps<1:
+        raise ConfigError("direct_fit_s 至少需要一个训练 step")
+    if result.adam_beta1>=1 or result.adam_beta2>=1:
+        raise ConfigError("direct_fit_s Adam beta 必须位于 (0,1)")
+    if result.warp_identity_epsilon>=.5:
         raise ConfigError(
-            "geometry_cache.interpolation_neighbor_count 不能大于 anchor count")
+            "direct_fit_s.warp_identity_epsilon 必须小于 0.5")
+    if result.cycle_endpoint_frames*2>result.cycle_sample_frames:
+        raise ConfigError(
+            "direct_fit_s.cycle_endpoint_frames 的两端总数不能大于 "
+            "cycle_sample_frames")
     return result
 
 
@@ -538,8 +696,6 @@ def parse_reconstruction_config(
 
     known = {
         "calibration_file",
-        "s1",
-        "s2",
         "show_point_cloud",
         "pair_fill_count",
         "sample_count",
@@ -548,9 +704,12 @@ def parse_reconstruction_config(
         "observation_grid",
         "residual_coefficient_grid",
         "residual_texture_grid",
+        "side_edge_exclusion_ratio",
         "uv_boundary_smooth_lambda",
         "uv_boundary_huber_delta_px",
         "curve_convexity",
+        "bend_direction",
+        "material_surface",
     }
     unknown = set(raw) - known
     if unknown:
@@ -570,11 +729,10 @@ def parse_reconstruction_config(
     if not calibration_path.is_absolute():
         calibration_path = Path(config_path).expanduser().parent / calibration_path
 
-    s1 = raw.get("s1", 11.0)
-    s2 = raw.get("s2", -11.0)
     show_point_cloud = raw.get("show_point_cloud", True)
     pair_fill_count = raw.get("pair_fill_count", 10)
     sample_count = raw.get("sample_count", 100)
+    side_edge_exclusion_ratio=raw.get("side_edge_exclusion_ratio",.02)
 
     def parse_grid(name: str, fallback_rows: object,
                    fallback_columns: object, *,
@@ -630,7 +788,67 @@ def parse_reconstruction_config(
     pair_fill_count=geometry_columns-2
     uv_boundary_smooth_lambda = raw.get("uv_boundary_smooth_lambda", 10.0)
     uv_boundary_huber_delta_px = raw.get("uv_boundary_huber_delta_px", 2.0)
-    curve_convexity = raw.get("curve_convexity", "none")
+    legacy_curve_convexity = raw.get("curve_convexity")
+    direction_field=(
+        "curve_convexity"
+        if "curve_convexity" in raw and "bend_direction" not in raw
+        else "bend_direction")
+    bend_direction = raw.get(
+        "bend_direction",
+        legacy_curve_convexity if legacy_curve_convexity is not None else "none")
+    if legacy_curve_convexity is not None \
+            and bend_direction != legacy_curve_convexity:
+        raise ConfigError(
+            "get_surface.reconstruction.bend_direction 与旧字段 "
+            "curve_convexity 不能冲突")
+    curve_convexity = bend_direction
+
+    raw_material = raw.get("material_surface", {})
+    if not isinstance(raw_material, Mapping):
+        raise ConfigError(
+            "get_surface.reconstruction.material_surface 必须是字典")
+    known_material = {
+        "width_mm","length_mm","s_zero_endpoint",
+        "initial_calibration_maximum_rms_px",
+        "calibration_maximum_rms_px","calibration_minimum_confidence",
+        "match_confidence_scale_mm",
+        "rms_confidence_scale_px","confidence_floor",
+        "visibility_depth_tolerance_mm",
+    }
+    unknown_material = set(raw_material)-known_material
+    if unknown_material:
+        raise ConfigError(
+            "get_surface.reconstruction.material_surface 包含未知字段: "
+            f"{sorted(unknown_material)}")
+    material_values = {
+        "width_mm":raw_material.get("width_mm",22.),
+        "length_mm":raw_material.get("length_mm",55.),
+        "s_zero_endpoint":raw_material.get(
+            "s_zero_endpoint","image_top"),
+        "initial_calibration_maximum_rms_px":raw_material.get(
+            "initial_calibration_maximum_rms_px",4.),
+        "calibration_maximum_rms_px":raw_material.get(
+            "calibration_maximum_rms_px",4.),
+        "calibration_minimum_confidence":raw_material.get(
+            "calibration_minimum_confidence",.05),
+        "match_confidence_scale_mm":raw_material.get(
+            "match_confidence_scale_mm",8.),
+        "rms_confidence_scale_px":raw_material.get(
+            "rms_confidence_scale_px",4.),
+        "confidence_floor":raw_material.get("confidence_floor",1e-6),
+        "visibility_depth_tolerance_mm":raw_material.get(
+            "visibility_depth_tolerance_mm",1.),
+    }
+
+    for dimension_name in ("width_mm","length_mm"):
+        dimension=material_values[dimension_name]
+        if not isinstance(dimension,Real) or isinstance(dimension,bool) \
+                or not np.isfinite(float(dimension)) or float(dimension)<=0:
+            raise ConfigError(
+                f"material_surface.{dimension_name} 必须是有限正数")
+    width_mm=float(material_values["width_mm"])
+    s1=width_mm/2
+    s2=-width_mm/2
 
     for name, value in (("s1", s1), ("s2", s2)):
         if not isinstance(value, Real) or isinstance(value, bool):
@@ -650,6 +868,15 @@ def parse_reconstruction_config(
                 f"get_surface.reconstruction.{name} 必须是大于等于 {minimum} 的整数"
             )
     if (
+        not isinstance(side_edge_exclusion_ratio,Real)
+        or isinstance(side_edge_exclusion_ratio,bool)
+        or not 0<=float(side_edge_exclusion_ratio)<.5
+    ):
+        raise ConfigError(
+            "get_surface.reconstruction.side_edge_exclusion_ratio "
+            "必须位于 [0,0.5)"
+        )
+    if (
         not isinstance(uv_boundary_smooth_lambda, Real)
         or isinstance(uv_boundary_smooth_lambda, bool)
         or float(uv_boundary_smooth_lambda) < 0
@@ -667,9 +894,39 @@ def parse_reconstruction_config(
         )
     if curve_convexity not in ("none", "increasing", "decreasing"):
         raise ConfigError(
-            "get_surface.reconstruction.curve_convexity 必须是 "
+            f"get_surface.reconstruction.{direction_field} 必须是 "
             "none、increasing 或 decreasing"
         )
+    for name in (
+        "width_mm","length_mm",
+        "initial_calibration_maximum_rms_px",
+        "calibration_maximum_rms_px",
+        "match_confidence_scale_mm",
+        "rms_confidence_scale_px",
+        "visibility_depth_tolerance_mm",
+    ):
+        value=material_values[name]
+        if not isinstance(value,Real) or isinstance(value,bool) or float(value)<=0:
+            raise ConfigError(f"material_surface.{name} 必须是正数")
+    s_zero_endpoint=material_values["s_zero_endpoint"]
+    if s_zero_endpoint not in ("image_top","image_bottom"):
+        raise ConfigError(
+            "material_surface.s_zero_endpoint 必须是 image_top 或 image_bottom")
+    confidence_floor=material_values["confidence_floor"]
+    calibration_minimum_confidence=(
+        material_values["calibration_minimum_confidence"])
+    if not isinstance(confidence_floor,Real) \
+            or isinstance(confidence_floor,bool) \
+            or not 0<float(confidence_floor)<1:
+        raise ConfigError(
+            "material_surface.confidence_floor 必须位于 (0,1)")
+    if not isinstance(calibration_minimum_confidence,Real) \
+            or isinstance(calibration_minimum_confidence,bool) \
+            or not float(confidence_floor)<float(
+                calibration_minimum_confidence)<1:
+        raise ConfigError(
+            "material_surface.calibration_minimum_confidence 必须大于 "
+            "confidence_floor 且小于 1")
     camera_matrix, distortion = load_camera_calibration(calibration_path)
     return ReconstructionConfig(
         calibration_file=calibration_path,
@@ -680,6 +937,7 @@ def parse_reconstruction_config(
         show_point_cloud=show_point_cloud,
         pair_fill_count=int(pair_fill_count),
         sample_count=int(sample_count),
+        side_edge_exclusion_ratio=float(side_edge_exclusion_ratio),
         uv_boundary_smooth_lambda=float(uv_boundary_smooth_lambda),
         uv_boundary_huber_delta_px=float(uv_boundary_huber_delta_px),
         curve_convexity=str(curve_convexity),
@@ -691,4 +949,23 @@ def parse_reconstruction_config(
         residual_coefficient_columns=residual_coefficient_columns,
         residual_texture_rows=residual_texture_rows,
         residual_texture_columns=residual_texture_columns,
+        material_surface=MaterialSurfaceConfig(
+            width_mm=float(material_values["width_mm"]),
+            length_mm=float(material_values["length_mm"]),
+            s_zero_endpoint=str(s_zero_endpoint),
+            initial_calibration_maximum_rms_px=float(
+                material_values["initial_calibration_maximum_rms_px"]),
+            calibration_maximum_rms_px=float(
+                material_values["calibration_maximum_rms_px"]),
+            calibration_minimum_confidence=float(
+                calibration_minimum_confidence),
+            match_confidence_scale_mm=float(
+                material_values["match_confidence_scale_mm"]),
+            rms_confidence_scale_px=float(
+                material_values["rms_confidence_scale_px"]),
+            confidence_floor=float(confidence_floor),
+            visibility_depth_tolerance_mm=float(
+                material_values["visibility_depth_tolerance_mm"]),
+            bend_direction=str(bend_direction),
+        ),
     )

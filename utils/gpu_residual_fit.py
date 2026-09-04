@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from utils.lightfield import (
+    DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,
     _fit_bspline_fields_pcg_jax,
     bspline_basis,
     direct_background_features_jax,
@@ -39,7 +40,7 @@ def _adaptive_channel_weights(
     return jax.lax.stop_gradient(weights)
 
 
-def _save_direct_fit_checkpoint(
+def _save_direct_fit_3_checkpoint(
     path: str | Path,*,step: int,validation_rmse_rgb: np.ndarray,
     validation_difference_rmse_rgb: np.ndarray,
     validation_spatial_difference_rmse_rgb: np.ndarray,
@@ -51,7 +52,7 @@ def _save_direct_fit_checkpoint(
     parameters: object,moments: object,variances: object,
     separate_channel_decoders: bool = False,
 ) -> None:
-    """原子覆盖 direct_fit 的最佳模型/优化器 checkpoint。"""
+    """原子覆盖 direct_fit_3 的最佳模型/优化器 checkpoint。"""
     output=Path(path).expanduser()
     output.parent.mkdir(parents=True,exist_ok=True)
     host_parameters,host_moments,host_variances=jax.device_get(
@@ -61,7 +62,7 @@ def _save_direct_fit_checkpoint(
     encoder_v,decoder_v=host_variances
     payload: dict[str,np.ndarray]={
         "checkpoint_format_version":np.asarray(
-            4 if separate_channel_decoders else 3,np.int32),
+            5 if separate_channel_decoders else 3,np.int32),
         "step":np.asarray(step,np.int32),
         "validation_rmse_rgb":np.asarray(validation_rmse_rgb,np.float32),
         "validation_difference_rmse_rgb":np.asarray(
@@ -177,18 +178,6 @@ def _fit_direct_static_base_gpu(
     return result
 
 
-def fit_robust_static_background_gpu(
-    fields: np.ndarray,valid: np.ndarray,*,device: jax.Device,
-    huber_delta: float,iterations: int,frame_batch_size: int,
-    shared_rgb_weights: bool = False,
-) -> np.ndarray:
-    """公开的逐像素分通道 Huber 背景聚合，供 direct/cache 模式复用。"""
-    return _fit_direct_static_base_gpu(
-        fields,valid,device=device,huber_delta=huber_delta,
-        iterations=iterations,frame_batch_size=frame_batch_size,
-        shared_rgb_weights=shared_rgb_weights)
-
-
 def _surface_curvature_scores_gpu(
     surface_xyz: np.ndarray,
     feature_count: int,
@@ -271,10 +260,8 @@ def fit_direct_geometry_conditioned_field_gpu(
     base_huber_iterations: int = 5,
     adaptive_channel_weight_strength: float = 0.,
     spatial_difference_weight: float = 1.,
-    spatial_difference_validation_weight: float = 1.,
     spatial_difference_points_per_frame: int = 1024,
     geometry_difference_weight: float = .25,
-    geometry_difference_validation_weight: float = .25,
     geometry_difference_neighbor_count: int = 16,
     geometry_difference_points_per_pair: int = 512,
     validation_interval: int = 100,validation_points_per_frame: int = 512,
@@ -340,9 +327,7 @@ def fit_direct_geometry_conditioned_field_gpu(
     if learning_rate<=0 or huber_delta<=0 \
             or not 0<=adaptive_channel_weight_strength<=1 \
             or spatial_difference_weight<0 \
-            or spatial_difference_validation_weight<0 \
-            or geometry_difference_weight<0 \
-            or geometry_difference_validation_weight<0:
+            or geometry_difference_weight<0:
         raise ValueError("direct neural field 优化参数无效")
     if not isinstance(separate_channel_decoders,bool):
         raise ValueError("separate_channel_decoders 必须是布尔值")
@@ -382,14 +367,16 @@ def fit_direct_geometry_conditioned_field_gpu(
         direct_geometry_descriptor_jax(value,geometry_descriptor_rows),
         direct_local_geometry_feature_grid_jax(value))))
     descriptor_batches=[]
-    local_sum=np.zeros(15,np.float64)
-    local_square_sum=np.zeros(15,np.float64)
+    local_sum=np.zeros(DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,np.float64)
+    local_square_sum=np.zeros(
+        DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,np.float64)
     local_count=0
     for start in range(0,surfaces.shape[0],32):
         descriptor_batch,local_batch=jax.device_get(analyze_geometry(
             jax.device_put(surfaces[start:start+32],device)))
         descriptor_batches.append(np.asarray(descriptor_batch,np.float32))
-        local_values=np.asarray(local_batch,np.float32).reshape(-1,15)
+        local_values=np.asarray(local_batch,np.float32).reshape(
+            -1,DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT)
         local_sum+=local_values.sum(axis=0,dtype=np.float64)
         local_square_sum+=np.square(
             local_values,dtype=np.float64).sum(axis=0,dtype=np.float64)
@@ -523,7 +510,7 @@ def fit_direct_geometry_conditioned_field_gpu(
         for frame_index,frame_mask in enumerate(validation_mask):
             pairs=adjacent_pairs(frame_mask)
             if pairs.size==0:
-                if spatial_difference_validation_weight>0:
+                if spatial_difference_weight>0:
                     raise ValueError("direct validation 帧没有相邻有效像素")
                 first=np.flatnonzero(frame_mask)[0]
                 pairs=np.asarray([[first,first]],np.int64)
@@ -571,7 +558,8 @@ def fit_direct_geometry_conditioned_field_gpu(
         geometry_latent_dimensions])
     decoder_input_count=(coordinate_feature_count
                          +geometry_latent_dimensions
-                         +geometry_pca_dimensions+15)
+                         +geometry_pca_dimensions
+                         +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT)
     # 完整条件输入跳连到每个隐层，避免局部几何在深层被洗掉。
     def initialize_decoder(output_count: int):
         decoder_sizes=[(decoder_input_count,decoder_width)]
@@ -873,8 +861,7 @@ def fit_direct_geometry_conditioned_field_gpu(
               f"points/frame={validation_points_per_frame}，"
               f"interval={validation_interval}，patience={early_stopping_patience}，"
               f"min_steps={early_stopping_min_steps}，"
-              "geometry-difference weight="
-              f"{geometry_difference_validation_weight:g}")
+              "checkpoint metric=absolute RGB RMSE")
     best_parameters=None
     best_validation_score=np.inf
     best_validation_rmse=np.full(3,np.inf,np.float32)
@@ -994,15 +981,9 @@ def fit_direct_geometry_conditioned_field_gpu(
             validation_spatial_difference_rmse=np.asarray(
                 validation_spatial_difference_rmse,np.float32)
             absolute_score=float(np.mean(validation_rmse**2))
-            difference_score=float(np.mean(validation_difference_rmse**2))
-            spatial_difference_score=float(np.mean(
-                validation_spatial_difference_rmse**2))
-            validation_score=float(np.sqrt(
-                (absolute_score+geometry_difference_validation_weight
-                 *difference_score+spatial_difference_validation_weight
-                 *spatial_difference_score)
-                /(1+geometry_difference_validation_weight
-                  +spatial_difference_validation_weight)))
+            # 差分项是辅助训练信号和诊断，不是最终任务。让它们参与
+            # checkpoint 排名会选中绝对颜色误差更大的模型。
+            validation_score=float(np.sqrt(absolute_score))
             is_best=validation_score<best_validation_score
             significant_improvement=(validation_score
                 <patience_reference_score-early_stopping_min_delta)
@@ -1015,7 +996,7 @@ def fit_direct_geometry_conditioned_field_gpu(
                     validation_spatial_difference_rmse)
                 best_step=index
                 if checkpoint_path is not None:
-                    _save_direct_fit_checkpoint(
+                    _save_direct_fit_3_checkpoint(
                         checkpoint_path,step=index,
                         validation_rmse_rgb=validation_rmse,
                         validation_difference_rmse_rgb=(

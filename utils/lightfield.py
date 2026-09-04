@@ -1,6 +1,6 @@
 """无局部形变近场线光源模型（JAX/XLA）。"""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass,replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Mapping
@@ -13,14 +13,13 @@ import yaml
 from .jax_reconstruction import SURFACE_RECONSTRUCTION_PIPELINE_VERSION
 
 CHANNELS = ("R", "G", "B")
-DIRECT_BACKGROUND_METHODS = ("direct_fit", "direct_fit_3")
-GEOMETRY_BACKGROUND_METHODS = (
-    "direct_fit", "direct_fit_3", "geometry_cache")
+DIRECT_BACKGROUND_METHODS = ("direct_fit_3","direct_fit_s")
 VALID_LIGHT_SOURCE_SIDES = ("left", "right", "top", "bottom")
 LightSourceLayout = tuple[tuple[str,...],tuple[str,...],tuple[str,...]]
 DEFAULT_LIGHT_SOURCE_LAYOUT: LightSourceLayout = (
     ("right",),("left",),("bottom",))
 Array = jax.Array
+DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT = 10
 
 def parse_light_source_layout(value: Mapping[str, Any]) -> LightSourceLayout:
     """把 RGB->一个或多个边界转换为固定顺序的不可变灯带布局。"""
@@ -93,25 +92,20 @@ class LightFieldModel:
     direct_local_geometry_feature_scale: Array | None = None
     direct_geometry_encoder_weights: tuple[Array,...] | None = None
     direct_geometry_encoder_biases: tuple[Array,...] | None = None
-    direct_decoder_weights: tuple[Array,...] | None = None
-    direct_decoder_biases: tuple[Array,...] | None = None
     direct_channel_decoder_weights: tuple[tuple[Array,...],...] | None = None
     direct_channel_decoder_biases: tuple[tuple[Array,...],...] | None = None
     direct_geometry_descriptor_rows: int = 24
     direct_curve_convexity: str = "none"
     direct_reconstruction_pipeline: str = SURFACE_RECONSTRUCTION_PIPELINE_VERSION
-    geometry_cache_base_texture: Array | None = None
-    geometry_cache_anchor_coefficients: Array | None = None
-    geometry_cache_descriptor_mean: Array | None = None
-    geometry_cache_descriptor_scale: Array | None = None
-    geometry_cache_pca_components: Array | None = None
-    geometry_cache_pca_scale: Array | None = None
-    geometry_cache_anchor_keys: Array | None = None
-    geometry_cache_curve_coefficients: int = 12
-    geometry_cache_descriptor_huber_delta: float = .5
-    geometry_cache_interpolation_neighbors: int = 4
-    geometry_cache_distance_power: float = 2.
-    geometry_cache_distance_epsilon: float = 1e-3
+    reconstruction_pipeline: str = SURFACE_RECONSTRUCTION_PIPELINE_VERSION
+    material_template_sha256: str | None = "0"*64
+    direct_s_gru_input_weight: Array | None = None
+    direct_s_gru_recurrent_weight: Array | None = None
+    direct_s_gru_bias: Array | None = None
+    direct_s_warp_weight: Array | None = None
+    direct_s_warp_bias: Array | None = None
+    direct_s_color_trunk_weights: tuple[Array,...] | None = None
+    direct_s_color_trunk_biases: tuple[Array,...] | None = None
 
     def tree_flatten(self):
         return (self.delta, self.beta, self.bias, self.scatter_ratio,
@@ -128,33 +122,27 @@ class LightFieldModel:
                 self.direct_local_geometry_feature_scale,
                 self.direct_geometry_encoder_weights,
                 self.direct_geometry_encoder_biases,
-                self.direct_decoder_weights,
-                self.direct_decoder_biases,
                 self.direct_channel_decoder_weights,
                 self.direct_channel_decoder_biases,
-                self.geometry_cache_base_texture,
-                self.geometry_cache_anchor_coefficients,
-                self.geometry_cache_descriptor_mean,
-                self.geometry_cache_descriptor_scale,
-                self.geometry_cache_pca_components,
-                self.geometry_cache_pca_scale,
-                self.geometry_cache_anchor_keys),(
+                self.direct_s_gru_input_weight,
+                self.direct_s_gru_recurrent_weight,
+                self.direct_s_gru_bias,
+                self.direct_s_warp_weight,
+                self.direct_s_warp_bias,
+                self.direct_s_color_trunk_weights,
+                self.direct_s_color_trunk_biases),(
                     self.source_layout,self.background_method,
                     self.direct_geometry_descriptor_rows,
                     self.direct_curve_convexity,
                     self.direct_reconstruction_pipeline,
-                    self.geometry_cache_curve_coefficients,
-                    self.geometry_cache_descriptor_huber_delta,
-                    self.geometry_cache_interpolation_neighbors,
-                    self.geometry_cache_distance_power,
-                    self.geometry_cache_distance_epsilon)
+                    self.reconstruction_pipeline,
+                    self.material_template_sha256)
 
     @classmethod
     def tree_unflatten(cls, auxiliary, children):
         (source_layout,background_method,descriptor_rows,
-         curve_convexity,reconstruction_pipeline,cache_curve_coefficients,
-         cache_huber_delta,cache_interpolation_neighbors,
-         cache_distance_power,cache_distance_epsilon)=auxiliary
+         curve_convexity,reconstruction_pipeline,
+         common_reconstruction_pipeline,material_template_sha256)=auxiliary
         core=children[:8]
         direct=children[8:]
         return cls(
@@ -170,81 +158,20 @@ class LightFieldModel:
             direct_local_geometry_feature_scale=direct[7],
             direct_geometry_encoder_weights=direct[8],
             direct_geometry_encoder_biases=direct[9],
-            direct_decoder_weights=direct[10],
-            direct_decoder_biases=direct[11],
-            direct_channel_decoder_weights=direct[12],
-            direct_channel_decoder_biases=direct[13],
+            direct_channel_decoder_weights=direct[10],
+            direct_channel_decoder_biases=direct[11],
             direct_geometry_descriptor_rows=descriptor_rows,
             direct_curve_convexity=curve_convexity,
             direct_reconstruction_pipeline=reconstruction_pipeline,
-            geometry_cache_base_texture=direct[14],
-            geometry_cache_anchor_coefficients=direct[15],
-            geometry_cache_descriptor_mean=direct[16],
-            geometry_cache_descriptor_scale=direct[17],
-            geometry_cache_pca_components=direct[18],
-            geometry_cache_pca_scale=direct[19],
-            geometry_cache_anchor_keys=direct[20],
-            geometry_cache_curve_coefficients=cache_curve_coefficients,
-            geometry_cache_descriptor_huber_delta=cache_huber_delta,
-            geometry_cache_interpolation_neighbors=(
-                cache_interpolation_neighbors),
-            geometry_cache_distance_power=cache_distance_power,
-            geometry_cache_distance_epsilon=cache_distance_epsilon)
-
-    @classmethod
-    def direct_fit(
-        cls,session_b_coefficients: Array,
-        *,base_texture: Array,coordinate_frequencies: Array,
-        geometry_feature_mean: Array,
-        geometry_feature_scale: Array,
-        geometry_pca_components: Array,
-        geometry_pca_scale: Array,
-        local_geometry_feature_mean: Array,
-        local_geometry_feature_scale: Array,
-        geometry_encoder_weights: tuple[Array,...],
-        geometry_encoder_biases: tuple[Array,...],
-        decoder_weights: tuple[Array,...],
-        decoder_biases: tuple[Array,...],
-        geometry_descriptor_rows: int = 24,
-        curve_convexity: str = "none",
-        reconstruction_pipeline: str = SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
-        source_layout: LightSourceLayout = DEFAULT_LIGHT_SOURCE_LAYOUT,
-    ) -> "LightFieldModel":
-        """建立静态 B、几何 delta B 和独立低频 Bsession 的 direct 模型。"""
-        if curve_convexity not in {"none","increasing","decreasing"}:
-            raise ValueError(
-                "direct curve_convexity 必须是 none、increasing 或 decreasing")
-        if reconstruction_pipeline!=SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
-            raise ValueError("direct reconstruction pipeline 元数据无效")
-        session=jnp.asarray(session_b_coefficients,jnp.float32)
-        base=jnp.asarray(base_texture,jnp.float32)
-        if base.ndim!=3 or base.shape[-1]!=3 or min(base.shape[:2])<2 \
-                or not bool(jnp.all(jnp.isfinite(base))) \
-                or not bool(jnp.all((base>=0)&(base<=1))):
-            raise ValueError("direct base_texture 必须是 [0,1] 内有限的 HxWx3")
-        source_count=len(light_source_specs(source_layout))
-        return cls(
-            jnp.zeros((source_count,2),jnp.float32),
-            jnp.zeros((source_count,4),jnp.float32),
-            jnp.zeros((3,),jnp.float32),
-            jnp.zeros((source_count,),jnp.float32),
-            jnp.ones((source_count,),jnp.float32),jnp.eye(3,dtype=jnp.float32),
-            session,jnp.zeros((0,*session.shape),jnp.float32),source_layout,
-            "direct_fit",base,jnp.asarray(coordinate_frequencies,jnp.float32),
-            jnp.asarray(geometry_feature_mean,jnp.float32),
-            jnp.asarray(geometry_feature_scale,jnp.float32),
-            jnp.asarray(geometry_pca_components,jnp.float32),
-            jnp.asarray(geometry_pca_scale,jnp.float32),
-            jnp.asarray(local_geometry_feature_mean,jnp.float32),
-            jnp.asarray(local_geometry_feature_scale,jnp.float32),
-            tuple(jnp.asarray(value,jnp.float32)
-                  for value in geometry_encoder_weights),
-            tuple(jnp.asarray(value,jnp.float32)
-                  for value in geometry_encoder_biases),
-            tuple(jnp.asarray(value,jnp.float32) for value in decoder_weights),
-            tuple(jnp.asarray(value,jnp.float32) for value in decoder_biases),
-            None,None,geometry_descriptor_rows,curve_convexity,
-            reconstruction_pipeline)
+            reconstruction_pipeline=common_reconstruction_pipeline,
+            material_template_sha256=material_template_sha256,
+            direct_s_gru_input_weight=direct[12],
+            direct_s_gru_recurrent_weight=direct[13],
+            direct_s_gru_bias=direct[14],
+            direct_s_warp_weight=direct[15],
+            direct_s_warp_bias=direct[16],
+            direct_s_color_trunk_weights=direct[17],
+            direct_s_color_trunk_biases=direct[18])
 
     @classmethod
     def direct_fit_3(
@@ -301,7 +228,6 @@ class LightFieldModel:
                   for value in geometry_encoder_weights),
             tuple(jnp.asarray(value,jnp.float32)
                   for value in geometry_encoder_biases),
-            None,None,
             tuple(tuple(jnp.asarray(value,jnp.float32) for value in decoder)
                   for decoder in channel_decoder_weights),
             tuple(tuple(jnp.asarray(value,jnp.float32) for value in decoder)
@@ -309,123 +235,104 @@ class LightFieldModel:
             geometry_descriptor_rows,curve_convexity,reconstruction_pipeline)
 
     @classmethod
-    def geometry_cache(
-        cls,session_b_coefficients: Array,*,base_texture: Array,
-        anchor_coefficients: Array,descriptor_mean: Array,
-        descriptor_scale: Array,pca_components: Array,pca_scale: Array,
-        anchor_keys: Array,curve_coefficients: int = 12,
-        descriptor_huber_delta: float = .5,
-        interpolation_neighbors: int = 4,distance_power: float = 2.,
-        distance_epsilon: float = 1e-3,curve_convexity: str = "none",
+    def direct_fit_s(
+        cls,session_b_coefficients: Array,
+        *,base_texture: Array,coordinate_frequencies: Array,
+        geometry_feature_mean: Array,geometry_feature_scale: Array,
+        geometry_pca_components: Array,geometry_pca_scale: Array,
+        local_geometry_feature_mean: Array,local_geometry_feature_scale: Array,
+        geometry_encoder_weights: tuple[Array,...],
+        geometry_encoder_biases: tuple[Array,...],
+        gru_input_weight: Array,gru_recurrent_weight: Array,gru_bias: Array,
+        warp_weight: Array,warp_bias: Array,
+        color_trunk_weights: tuple[Array,...],
+        color_trunk_biases: tuple[Array,...],
+        channel_head_weights: tuple[tuple[Array,...],...],
+        channel_head_biases: tuple[tuple[Array,...],...],
+        geometry_descriptor_rows: int = 32,
+        curve_convexity: str = "none",
         reconstruction_pipeline: str = SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
         source_layout: LightSourceLayout = DEFAULT_LIGHT_SOURCE_LAYOUT,
     ) -> "LightFieldModel":
-        """建立几何锚点缓存与 RGB B-spline 增量插值背景模型。"""
-        session=np.asarray(session_b_coefficients,np.float32)
-        base=np.asarray(base_texture,np.float32)
-        anchors=np.asarray(anchor_coefficients,np.float32)
-        mean=np.asarray(descriptor_mean,np.float32)
-        scale=np.asarray(descriptor_scale,np.float32)
-        components=np.asarray(pca_components,np.float32)
-        component_scale=np.asarray(pca_scale,np.float32)
-        keys=np.asarray(anchor_keys,np.float32)
+        """建立 raw geometry MLP -> GRU -> affine-s warp 的 direct_fit_s。"""
+        if curve_convexity not in {"none","increasing","decreasing"}:
+            raise ValueError(
+                "direct curve_convexity 必须是 none、increasing 或 decreasing")
+        if reconstruction_pipeline!=SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
+            raise ValueError("direct reconstruction pipeline 元数据无效")
+        if len(channel_head_weights)!=3 or len(channel_head_biases)!=3:
+            raise ValueError("direct_fit_s 必须包含 R/G/B 三个独立 head")
+        session=jnp.asarray(session_b_coefficients,jnp.float32)
         source_count=len(light_source_specs(source_layout))
-        if session.ndim!=3 or session.shape[0]!=3 or min(session.shape[1:])<4:
-            raise ValueError("geometry_cache Bsession 必须是 3xRxC")
-        if base.ndim!=3 or base.shape[-1]!=3 or min(base.shape[:2])<2 \
-                or not np.isfinite(base).all() or np.any((base<0)|(base>1)):
-            raise ValueError("geometry_cache base texture 无效")
-        if not isinstance(curve_coefficients,int) \
-                or isinstance(curve_coefficients,bool) or curve_coefficients<4:
-            raise ValueError("geometry_cache 几何描述参数无效")
-        descriptor_count=4*curve_coefficients
-        if mean.shape!=(descriptor_count,) or scale.shape!=mean.shape \
-                or np.any(scale<=0) or not np.isfinite(mean).all() \
-                or not np.isfinite(scale).all():
-            raise ValueError("geometry_cache 几何描述参数无效")
-        if components.ndim!=2 or components.shape[0]!=descriptor_count \
-                or components.shape[1]<1 \
-                or component_scale.shape!=(components.shape[1],) \
-                or np.any(component_scale<=0) \
-                or not np.isfinite(components).all() \
-                or not np.isfinite(component_scale).all():
-            raise ValueError("geometry_cache PCA 参数无效")
-        anchor_count=anchors.shape[0] if anchors.ndim==4 else -1
-        if anchor_count<1 or anchors.shape!=(anchor_count,3,*session.shape[1:]) \
-                or keys.shape!=(anchor_count,components.shape[1]) \
-                or not np.isfinite(anchors).all() or not np.isfinite(keys).all():
-            raise ValueError("geometry_cache 锚点尺寸无效")
-        if curve_convexity not in {"none","increasing","decreasing"} \
-                or reconstruction_pipeline!=SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
-            raise ValueError("geometry_cache 重建语义无效")
-        if not isinstance(interpolation_neighbors,int) \
-                or isinstance(interpolation_neighbors,bool) \
-                or not 1<=interpolation_neighbors<=anchor_count \
-                or descriptor_huber_delta<=0 or distance_power<=0 \
-                or distance_epsilon<=0:
-            raise ValueError("geometry_cache 插值参数无效")
         return cls(
-            delta=jnp.zeros((source_count,2),jnp.float32),
-            beta=jnp.zeros((source_count,4),jnp.float32),
-            bias=jnp.zeros((3,),jnp.float32),
-            scatter_ratio=jnp.zeros((source_count,),jnp.float32),
-            scatter_length=jnp.ones((source_count,),jnp.float32),
-            mixing_matrix=jnp.eye(3,dtype=jnp.float32),
-            residual_b_coefficients=jnp.asarray(session),
-            residual_m_coefficients=jnp.zeros((0,*session.shape),jnp.float32),
-            source_layout=source_layout,background_method="geometry_cache",
-            direct_curve_convexity=curve_convexity,
-            direct_reconstruction_pipeline=reconstruction_pipeline,
-            geometry_cache_base_texture=jnp.asarray(base),
-            geometry_cache_anchor_coefficients=jnp.asarray(anchors),
-            geometry_cache_descriptor_mean=jnp.asarray(mean),
-            geometry_cache_descriptor_scale=jnp.asarray(scale),
-            geometry_cache_pca_components=jnp.asarray(components),
-            geometry_cache_pca_scale=jnp.asarray(component_scale),
-            geometry_cache_anchor_keys=jnp.asarray(keys),
-            geometry_cache_curve_coefficients=curve_coefficients,
-            geometry_cache_descriptor_huber_delta=float(
-                descriptor_huber_delta),
-            geometry_cache_interpolation_neighbors=interpolation_neighbors,
-            geometry_cache_distance_power=float(distance_power),
-            geometry_cache_distance_epsilon=float(distance_epsilon))
+            jnp.zeros((source_count,2),jnp.float32),
+            jnp.zeros((source_count,4),jnp.float32),
+            jnp.zeros((3,),jnp.float32),
+            jnp.zeros((source_count,),jnp.float32),
+            jnp.ones((source_count,),jnp.float32),jnp.eye(3,dtype=jnp.float32),
+            session,jnp.zeros((0,*session.shape),jnp.float32),source_layout,
+            "direct_fit_s",jnp.asarray(base_texture,jnp.float32),
+            jnp.asarray(coordinate_frequencies,jnp.float32),
+            jnp.asarray(geometry_feature_mean,jnp.float32),
+            jnp.asarray(geometry_feature_scale,jnp.float32),
+            jnp.asarray(geometry_pca_components,jnp.float32),
+            jnp.asarray(geometry_pca_scale,jnp.float32),
+            jnp.asarray(local_geometry_feature_mean,jnp.float32),
+            jnp.asarray(local_geometry_feature_scale,jnp.float32),
+            tuple(jnp.asarray(value,jnp.float32)
+                  for value in geometry_encoder_weights),
+            tuple(jnp.asarray(value,jnp.float32)
+                  for value in geometry_encoder_biases),
+            tuple(tuple(jnp.asarray(value,jnp.float32) for value in head)
+                  for head in channel_head_weights),
+            tuple(tuple(jnp.asarray(value,jnp.float32) for value in head)
+                  for head in channel_head_biases),
+            geometry_descriptor_rows,curve_convexity,reconstruction_pipeline,
+            direct_s_gru_input_weight=jnp.asarray(
+                gru_input_weight,jnp.float32),
+            direct_s_gru_recurrent_weight=jnp.asarray(
+                gru_recurrent_weight,jnp.float32),
+            direct_s_gru_bias=jnp.asarray(gru_bias,jnp.float32),
+            direct_s_warp_weight=jnp.asarray(warp_weight,jnp.float32),
+            direct_s_warp_bias=jnp.asarray(warp_bias,jnp.float32),
+            direct_s_color_trunk_weights=tuple(
+                jnp.asarray(value,jnp.float32) for value in color_trunk_weights),
+            direct_s_color_trunk_biases=tuple(
+                jnp.asarray(value,jnp.float32) for value in color_trunk_biases))
 
     @classmethod
     def load(cls, path: str | Path, device: jax.Device | None = None) -> "LightFieldModel":
         with Path(path).expanduser().open("r", encoding="utf-8") as stream:
             raw = yaml.safe_load(stream)
         version=raw.get("format_version")
-        if version not in {9,10,11,12,13,14,15,16,17,18,19,20,21}:
+        if version not in {22,25,26}:
             raise ValueError("光场模型版本已经过期；请重新运行 calibrate-lightfield")
-        background_method=("physical_residual" if version==9
-                           else raw.get("background_method"))
+        background_method=raw.get("background_method")
         if background_method not in {
-                "physical_residual","direct_fit","direct_fit_3",
-                "geometry_cache"}:
+                "physical_residual","direct_fit_3","direct_fit_s"}:
             raise ValueError("光场模型包含无效 background_method")
-        if background_method=="direct_fit" and version<16:
+        expected_version={
+            "physical_residual":22,"direct_fit_3":25,"direct_fit_s":26}[
+                background_method]
+        if version!=expected_version:
             raise ValueError(
-                "旧 direct_fit 模型并非由完整实时 JAX XYZ/UV/depth 重建链训练；"
+                f"{background_method} 模型版本无效；"
                 "请重新运行 calibrate-lightfield")
-        if background_method=="direct_fit" and version!=18:
-            raise ValueError(
-                "direct_fit 模型版本无效或尚未拆分静态 B 与几何 delta B；"
-                "请重新运行 calibrate-lightfield")
-        if background_method=="direct_fit_3" and version!=19:
-            raise ValueError(
-                "direct_fit_3 模型版本无效；"
-                "请重新运行 calibrate-lightfield")
-        if background_method=="geometry_cache" and version!=21:
-            raise ValueError(
-                "geometry_cache 模型版本无效；请重新运行 calibrate-lightfield")
+        common_pipeline=raw.get("reconstruction_pipeline")
+        material_template_sha256=raw.get("material_template_sha256")
+        if common_pipeline!=SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
+            raise ValueError("光场模型的固定材料重建管线已经过期")
+        if not isinstance(material_template_sha256,str) \
+                or len(material_template_sha256)!=64 \
+                or any(character not in "0123456789abcdef"
+                       for character in material_template_sha256):
+            raise ValueError("光场模型缺少有效材料模板 SHA-256")
         try:
             source_layout=parse_light_source_layout(raw.get("light_source_layout"))
         except ValueError as error:
             raise ValueError("光场模型中的 RGB 灯带布局无效；请重新运行 calibrate-lightfield") from error
         expected_mode=(
             "difference_only" if background_method=="physical_residual" else
-            "geometry_background_plus_additive_session"
-            if background_method=="geometry_cache" else
             "static_base_plus_geometry_delta_plus_additive_session")
         if raw.get("residual_correction_mode") != expected_mode:
             raise ValueError("光场模型的背景场语义与 background_method 不一致")
@@ -437,15 +344,14 @@ class LightFieldModel:
             raise ValueError("residual_b_bspline_coefficients 必须是有限的 3xRxC 数组")
         if background_method in DIRECT_BACKGROUND_METHODS:
             if raw.get("base_coefficient_mode")!="direct_static_texture":
-                raise ValueError("direct_fit 模型缺少独立静态 B")
+                raise ValueError("direct 模型缺少独立静态 B")
             if raw.get("direct_session_correction_mode")!="additive_bspline":
                 raise ValueError("纯拟合模型缺少加性会话 B 修正语义")
             if raw.get("direct_base_mode")!="robust_full_resolution_texture" \
                     or raw.get("direct_delta_mode")!="additive_logit":
-                raise ValueError("direct_fit 缺少 B + delta B 语义")
-            if background_method=="direct_fit_3" \
-                    and raw.get("direct_base_channel_mode")!="independent_huber":
-                raise ValueError("direct_fit_3 缺少逐通道独立 B 拟合语义")
+                raise ValueError("direct 模型缺少 B + delta B 语义")
+            if raw.get("direct_base_channel_mode")!="independent_huber":
+                raise ValueError("direct 模型缺少逐通道独立 B 拟合语义")
             base_texture=np.asarray(raw.get("direct_base_texture"),np.float32)
             if base_texture.ndim!=3 or base_texture.shape[-1]!=3 \
                     or min(base_texture.shape[:2])<2 \
@@ -470,10 +376,6 @@ class LightFieldModel:
                                   raw.get("direct_geometry_encoder_weights",[]))
             encoder_biases=tuple(np.asarray(value,np.float32) for value in
                                  raw.get("direct_geometry_encoder_biases",[]))
-            decoder_weights=tuple(np.asarray(value,np.float32) for value in
-                                  raw.get("direct_decoder_weights",[]))
-            decoder_biases=tuple(np.asarray(value,np.float32) for value in
-                                 raw.get("direct_decoder_biases",[]))
             channel_decoder_weights=tuple(
                 tuple(np.asarray(value,np.float32) for value in decoder)
                 for decoder in raw.get("direct_channel_decoder_weights",[]))
@@ -509,8 +411,9 @@ class LightFieldModel:
                     or not np.isfinite(pca_scale).all() \
                     or np.any(pca_scale<=0):
                 raise ValueError("direct geometry PCA 参数无效")
-            if local_feature_mean.shape!=(15,) \
-                    or local_feature_scale.shape!=(15,) \
+            if local_feature_mean.shape!=(DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,) \
+                    or local_feature_scale.shape!=(
+                        DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,) \
                     or not np.isfinite(local_feature_mean).all() \
                     or not np.isfinite(local_feature_scale).all() \
                     or np.any(local_feature_scale<=0):
@@ -536,8 +439,6 @@ class LightFieldModel:
             validate_network(
                 encoder_weights,encoder_biases,feature_count,latent_count,
                 "geometry encoder")
-            decoder_input_count=(2+4*frequencies.size+latent_count
-                                 +pca_components.shape[1]+15)
             if raw.get("direct_decoder_skip_mode")!="input_every_layer":
                 raise ValueError("direct decoder 跳连语义无效")
 
@@ -556,36 +457,15 @@ class LightFieldModel:
                         raise ValueError(f"{name} 输出尺寸无效")
                     previous=weight.shape[1]+decoder_input_count
 
-            if background_method=="direct_fit":
-                validate_decoder(
-                    decoder_weights,decoder_biases,3,"direct RGB decoder")
-                if channel_decoder_weights or channel_decoder_biases:
-                    raise ValueError("direct_fit 不应包含分通道 decoder")
-                model=cls.direct_fit(
-                    residual_b,base_texture=base_texture,
-                    coordinate_frequencies=frequencies,
-                    geometry_feature_mean=feature_mean,
-                    geometry_feature_scale=feature_scale,
-                    geometry_pca_components=pca_components,
-                    geometry_pca_scale=pca_scale,
-                    local_geometry_feature_mean=local_feature_mean,
-                    local_geometry_feature_scale=local_feature_scale,
-                    geometry_encoder_weights=encoder_weights,
-                    geometry_encoder_biases=encoder_biases,
-                    decoder_weights=decoder_weights,
-                    decoder_biases=decoder_biases,
-                    geometry_descriptor_rows=descriptor_rows,
-                    curve_convexity=curve_convexity,
-                    reconstruction_pipeline=reconstruction_pipeline,
-                    source_layout=source_layout)
-            else:
-                if raw.get("direct_channel_decoder_order")!=list(CHANNELS) \
-                        or len(channel_decoder_weights)!=3 \
-                        or len(channel_decoder_biases)!=3:
-                    raise ValueError(
-                        "direct_fit_3 必须按 R/G/B 保存三个 decoder")
-                if decoder_weights or decoder_biases:
-                    raise ValueError("direct_fit_3 不应包含共享 RGB decoder")
+            if raw.get("direct_channel_decoder_order")!=list(CHANNELS) \
+                    or len(channel_decoder_weights)!=3 \
+                    or len(channel_decoder_biases)!=3:
+                raise ValueError(
+                    f"{background_method} 必须按 R/G/B 保存三个独立 head")
+            if background_method=="direct_fit_3":
+                decoder_input_count=(2+4*frequencies.size+latent_count
+                                     +pca_components.shape[1]
+                                     +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT)
                 for channel,weights,biases in zip(
                         CHANNELS,channel_decoder_weights,
                         channel_decoder_biases,strict=True):
@@ -608,51 +488,89 @@ class LightFieldModel:
                     curve_convexity=curve_convexity,
                     reconstruction_pipeline=reconstruction_pipeline,
                     source_layout=source_layout)
-        elif background_method=="geometry_cache":
-            if raw.get("base_coefficient_mode")!="geometry_cache_static_texture" \
-                    or raw.get("geometry_cache_session_correction_mode") \
-                    !="additive_bspline" \
-                    or raw.get("geometry_cache_mode") \
-                    !="nearest_anchor_convex_interpolation" \
-                    or raw.get("geometry_cache_anchor_axis_order")!=[
-                        "anchor","RGB","surface_row","surface_column"]:
-                raise ValueError("geometry_cache 模型语义无效")
-            base_texture=np.asarray(
-                raw.get("geometry_cache_base_texture"),np.float32)
-            anchor_coefficients=np.asarray(
-                raw.get("geometry_cache_anchor_bspline_coefficients"),
-                np.float32)
-            descriptor_mean=np.asarray(
-                raw.get("geometry_cache_descriptor_mean"),np.float32)
-            descriptor_scale=np.asarray(
-                raw.get("geometry_cache_descriptor_scale"),np.float32)
-            pca_components=np.asarray(
-                raw.get("geometry_cache_pca_components"),np.float32)
-            pca_scale=np.asarray(
-                raw.get("geometry_cache_pca_scale"),np.float32)
-            anchor_keys=np.asarray(
-                raw.get("geometry_cache_anchor_keys"),np.float32)
-            model=cls.geometry_cache(
-                residual_b,base_texture=base_texture,
-                anchor_coefficients=anchor_coefficients,
-                descriptor_mean=descriptor_mean,
-                descriptor_scale=descriptor_scale,
-                pca_components=pca_components,pca_scale=pca_scale,
-                anchor_keys=anchor_keys,
-                curve_coefficients=raw.get(
-                    "geometry_cache_curve_coefficients"),
-                descriptor_huber_delta=raw.get(
-                    "geometry_cache_descriptor_huber_delta_mm"),
-                interpolation_neighbors=raw.get(
-                    "geometry_cache_interpolation_neighbors"),
-                distance_power=raw.get(
-                    "geometry_cache_distance_power"),
-                distance_epsilon=raw.get(
-                    "geometry_cache_distance_epsilon"),
-                curve_convexity=raw.get("geometry_cache_curve_convexity"),
-                reconstruction_pipeline=raw.get(
-                    "geometry_cache_reconstruction_pipeline"),
-                source_layout=source_layout)
+            else:
+                if raw.get("direct_warp_mode")!="affine_s_softmax_interval" \
+                        or raw.get("direct_recurrent_mode")!="single_gru":
+                    raise ValueError("direct_fit_s 的 warp/GRU 语义无效")
+                gru_input=np.asarray(
+                    raw.get("direct_s_gru_input_weight"),np.float32)
+                gru_recurrent=np.asarray(
+                    raw.get("direct_s_gru_recurrent_weight"),np.float32)
+                gru_bias=np.asarray(raw.get("direct_s_gru_bias"),np.float32)
+                warp_weight=np.asarray(
+                    raw.get("direct_s_warp_weight"),np.float32)
+                warp_bias=np.asarray(raw.get("direct_s_warp_bias"),np.float32)
+                trunk_weights=tuple(np.asarray(value,np.float32) for value in
+                    raw.get("direct_s_color_trunk_weights",[]))
+                trunk_biases=tuple(np.asarray(value,np.float32) for value in
+                    raw.get("direct_s_color_trunk_biases",[]))
+                if gru_input.ndim!=2 or gru_input.shape[0]!=latent_count \
+                        or gru_input.shape[1]%3!=0:
+                    raise ValueError("direct_fit_s GRU 输入权重尺寸无效")
+                hidden_count=gru_input.shape[1]//3
+                if gru_recurrent.shape!=(hidden_count,3*hidden_count) \
+                        or gru_bias.shape!=(3*hidden_count,) \
+                        or warp_weight.shape!=(hidden_count,3) \
+                        or warp_bias.shape!=(3,) \
+                        or not all(np.isfinite(value).all() for value in (
+                            gru_input,gru_recurrent,gru_bias,warp_weight,
+                            warp_bias)):
+                    raise ValueError("direct_fit_s GRU/warp 权重尺寸无效")
+                color_input_count=(2+4*frequencies.size+latent_count
+                                   +pca_components.shape[1]
+                                   +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT
+                                   +hidden_count)
+                if not trunk_weights or len(trunk_weights)!=len(trunk_biases):
+                    raise ValueError("direct_fit_s 共享颜色 trunk 无效")
+                previous=color_input_count
+                for index,(weight,bias) in enumerate(zip(
+                        trunk_weights,trunk_biases,strict=True)):
+                    if weight.ndim!=2 or weight.shape[0]!=previous \
+                            or bias.shape!=(weight.shape[1],) \
+                            or not np.isfinite(weight).all() \
+                            or not np.isfinite(bias).all():
+                        raise ValueError("direct_fit_s 颜色 trunk 层尺寸无效")
+                    previous=weight.shape[1]+color_input_count
+                trunk_width=trunk_weights[-1].shape[1]
+                for channel,weights,biases in zip(
+                        CHANNELS,channel_decoder_weights,
+                        channel_decoder_biases,strict=True):
+                    if not weights or len(weights)!=len(biases):
+                        raise ValueError(f"direct_fit_s {channel} head 无效")
+                    previous=trunk_width+color_input_count
+                    for index,(weight,bias) in enumerate(zip(
+                            weights,biases,strict=True)):
+                        if weight.ndim!=2 or weight.shape[0]!=previous \
+                                or bias.shape!=(weight.shape[1],) \
+                                or not np.isfinite(weight).all() \
+                                or not np.isfinite(bias).all() \
+                                or (index==len(weights)-1
+                                    and weight.shape[1]!=1):
+                            raise ValueError(
+                                f"direct_fit_s {channel} head 层尺寸无效")
+                        previous=weight.shape[1]+color_input_count
+                model=cls.direct_fit_s(
+                    residual_b,base_texture=base_texture,
+                    coordinate_frequencies=frequencies,
+                    geometry_feature_mean=feature_mean,
+                    geometry_feature_scale=feature_scale,
+                    geometry_pca_components=pca_components,
+                    geometry_pca_scale=pca_scale,
+                    local_geometry_feature_mean=local_feature_mean,
+                    local_geometry_feature_scale=local_feature_scale,
+                    geometry_encoder_weights=encoder_weights,
+                    geometry_encoder_biases=encoder_biases,
+                    gru_input_weight=gru_input,
+                    gru_recurrent_weight=gru_recurrent,gru_bias=gru_bias,
+                    warp_weight=warp_weight,warp_bias=warp_bias,
+                    color_trunk_weights=trunk_weights,
+                    color_trunk_biases=trunk_biases,
+                    channel_head_weights=channel_decoder_weights,
+                    channel_head_biases=channel_decoder_biases,
+                    geometry_descriptor_rows=descriptor_rows,
+                    curve_convexity=curve_convexity,
+                    reconstruction_pipeline=reconstruction_pipeline,
+                    source_layout=source_layout)
         else:
             if raw.get("residual_m_basis") != "raw_offline":
                 raise ValueError("离线 M 必须保存为未正交化的 raw_offline 基底；请重新运行 calibrate-lightfield")
@@ -704,13 +622,15 @@ class LightFieldModel:
                 jnp.asarray(residual_b,jnp.float32),
                 jnp.asarray(residual_ms,jnp.float32),source_layout,
                 "physical_residual")
+        model=replace(
+            model,reconstruction_pipeline=common_pipeline,
+            material_template_sha256=material_template_sha256)
         return jax.device_put(model, device) if device is not None else model
 
     def save(self, path: str | Path) -> None:
         output = Path(path).expanduser(); output.parent.mkdir(parents=True, exist_ok=True)
         if self.background_method not in {
-                "physical_residual","direct_fit","direct_fit_3",
-                "geometry_cache"}:
+                "physical_residual","direct_fit_3","direct_fit_s"}:
             raise ValueError("background_method 无效")
         if not np.array_equal(np.asarray(self.bias), np.zeros(3,np.float32)):
             raise ValueError("离线模型的固定暗场基准必须为 [0, 0, 0]")
@@ -731,28 +651,30 @@ class LightFieldModel:
                 or residual_ms.shape[1:] != residual_b.shape
                 or not np.isfinite(residual_ms).all()):
             raise ValueError("residual_m_coefficients 必须是有限的 Kx3xRxC 数组")
-        if self.background_method in GEOMETRY_BACKGROUND_METHODS and (
+        if self.background_method in DIRECT_BACKGROUND_METHODS and (
                 residual_ms.shape!=(0,*residual_b.shape)):
-            raise ValueError("几何背景模式不应再包含显式 M 模式")
+            raise ValueError("direct 背景模式不应包含显式 M 模式")
+        if self.reconstruction_pipeline!=SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
+            raise ValueError("光场模型重建管线元数据无效")
+        if self.material_template_sha256 is None \
+                or len(self.material_template_sha256)!=64:
+            raise ValueError("保存光场模型前必须绑定材料模板 SHA-256")
         format_version={
-            "physical_residual":17,"direct_fit":18,"direct_fit_3":19,
-            "geometry_cache":21,
-        }[self.background_method]
+            "physical_residual":22,"direct_fit_3":25,"direct_fit_s":26}[
+                self.background_method]
         data = {"format_version":format_version,
                 "background_method":self.background_method,
+                "reconstruction_pipeline":self.reconstruction_pipeline,
+                "material_template_sha256":self.material_template_sha256,
                 "channel_order": list(CHANNELS),
                 "light_source_layout": light_source_layout_mapping(source_layout),
                 "bspline_degree":3,
                 "residual_correction_mode": (
                     "difference_only" if self.background_method=="physical_residual"
-                    else "geometry_background_plus_additive_session"
-                    if self.background_method=="geometry_cache" else
-                    "static_base_plus_geometry_delta_plus_additive_session"),
+                    else "static_base_plus_geometry_delta_plus_additive_session"),
                 "base_coefficient_mode": (
                     "free" if self.background_method=="physical_residual"
-                    else "geometry_cache_static_texture"
-                    if self.background_method=="geometry_cache" else
-                    "direct_static_texture"),
+                    else "direct_static_texture"),
                 "residual_b_axis_order": ["RGB", "surface_row", "surface_column"],
                 "residual_b_bspline_coefficients": residual_b.tolist()}
         if self.background_method=="physical_residual":
@@ -784,10 +706,10 @@ class LightFieldModel:
         elif self.background_method in DIRECT_BACKGROUND_METHODS:
             if self.direct_curve_convexity not in {
                     "none","increasing","decreasing"}:
-                raise ValueError("direct_fit 的曲线凸性元数据无效")
+                raise ValueError("direct_fit_3 的曲线凸性元数据无效")
             if self.direct_reconstruction_pipeline \
                     != SURFACE_RECONSTRUCTION_PIPELINE_VERSION:
-                raise ValueError("direct_fit 的重建链元数据无效")
+                raise ValueError("direct_fit_3 的重建链元数据无效")
             frequencies=np.asarray(self.direct_coordinate_frequencies)
             base_texture=np.asarray(self.direct_base_texture)
             feature_mean=np.asarray(self.direct_geometry_feature_mean)
@@ -802,10 +724,6 @@ class LightFieldModel:
                 self.direct_geometry_encoder_weights or ()))
             encoder_biases=tuple(np.asarray(value) for value in (
                 self.direct_geometry_encoder_biases or ()))
-            decoder_weights=tuple(np.asarray(value) for value in (
-                self.direct_decoder_weights or ()))
-            decoder_biases=tuple(np.asarray(value) for value in (
-                self.direct_decoder_biases or ()))
             channel_decoder_weights=tuple(
                 tuple(np.asarray(value) for value in decoder)
                 for decoder in (self.direct_channel_decoder_weights or ()))
@@ -816,11 +734,11 @@ class LightFieldModel:
                     or min(base_texture.shape[:2])<2 \
                     or not np.isfinite(base_texture).all() \
                     or np.any((base_texture<0)|(base_texture>1)):
-                raise ValueError("direct_fit 的静态 B 纹理无效")
+                raise ValueError("direct_fit_3 的静态 B 纹理无效")
             if frequencies.ndim!=1 or frequencies.size<1 \
                     or not np.isfinite(frequencies).all() \
                     or np.any(frequencies<=0):
-                raise ValueError("direct_fit 的坐标频率无效")
+                raise ValueError("direct_fit_3 的坐标频率无效")
             if not isinstance(self.direct_geometry_descriptor_rows,int) \
                     or isinstance(self.direct_geometry_descriptor_rows,bool) \
                     or self.direct_geometry_descriptor_rows<4 \
@@ -830,7 +748,7 @@ class LightFieldModel:
                     or not np.isfinite(feature_mean).all() \
                     or not np.isfinite(feature_scale).all() \
                     or np.any(feature_scale<=0):
-                raise ValueError("direct_fit 的几何特征归一化参数无效")
+                raise ValueError("direct_fit_3 的几何特征归一化参数无效")
             if pca_components.ndim!=2 \
                     or pca_components.shape[0]!=feature_mean.size \
                     or pca_components.shape[1]<1 \
@@ -838,66 +756,110 @@ class LightFieldModel:
                     or not np.isfinite(pca_components).all() \
                     or not np.isfinite(pca_scale).all() \
                     or np.any(pca_scale<=0):
-                raise ValueError("direct_fit 的几何 PCA 参数无效")
-            if local_feature_mean.shape!=(15,) \
-                    or local_feature_scale.shape!=(15,) \
+                raise ValueError("direct_fit_3 的几何 PCA 参数无效")
+            if local_feature_mean.shape!=(DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,) \
+                    or local_feature_scale.shape!=(
+                        DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT,) \
                     or not np.isfinite(local_feature_mean).all() \
                     or not np.isfinite(local_feature_scale).all() \
                     or np.any(local_feature_scale<=0):
-                raise ValueError("direct_fit 的局部几何特征归一化参数无效")
+                raise ValueError("direct_fit_3 的局部几何特征归一化参数无效")
 
             def validate_network(weights,biases,input_count,output_count,name):
                 if not weights or len(weights)!=len(biases):
-                    raise ValueError(f"direct_fit 的 {name} 网络无效")
+                    raise ValueError(f"direct_fit_3 的 {name} 网络无效")
                 previous=input_count
                 for weight,layer_bias in zip(weights,biases,strict=True):
                     if weight.ndim!=2 or weight.shape[0]!=previous \
                             or layer_bias.shape!=(weight.shape[1],) \
                             or not np.isfinite(weight).all() \
                             or not np.isfinite(layer_bias).all():
-                        raise ValueError(f"direct_fit 的 {name} 网络层尺寸无效")
+                        raise ValueError(f"direct_fit_3 的 {name} 网络层尺寸无效")
                     previous=weight.shape[1]
                 if previous!=output_count:
-                    raise ValueError(f"direct_fit 的 {name} 输出尺寸无效")
+                    raise ValueError(f"direct_fit_3 的 {name} 输出尺寸无效")
 
             latent_count=(encoder_weights[-1].shape[1]
                           if encoder_weights else -1)
             validate_network(
                 encoder_weights,encoder_biases,feature_mean.size,latent_count,
                 "geometry encoder")
-            decoder_input_count=(2+4*frequencies.size+latent_count
-                                 +pca_components.shape[1]+15)
-            def validate_decoder(weights,biases,output_count,name):
-                if not weights or len(weights)!=len(biases):
-                    raise ValueError(f"{name} 网络无效")
-                previous=decoder_input_count
-                for index,(weight,layer_bias) in enumerate(zip(
-                        weights,biases,strict=True)):
-                    if weight.ndim!=2 or weight.shape[0]!=previous \
-                            or layer_bias.shape!=(weight.shape[1],) \
-                            or not np.isfinite(weight).all() \
-                            or not np.isfinite(layer_bias).all() \
-                            or (index==len(weights)-1
-                                and weight.shape[1]!=output_count):
-                        raise ValueError(f"{name} 网络层尺寸无效")
-                    previous=weight.shape[1]+decoder_input_count
-            if self.background_method=="direct_fit":
-                validate_decoder(
-                    decoder_weights,decoder_biases,3,"direct_fit decoder")
-                if channel_decoder_weights or channel_decoder_biases:
-                    raise ValueError("direct_fit 不应包含分通道 decoder")
-            else:
-                if decoder_weights or decoder_biases:
-                    raise ValueError("direct_fit_3 不应包含共享 RGB decoder")
-                if len(channel_decoder_weights)!=3 \
-                        or len(channel_decoder_biases)!=3:
-                    raise ValueError(
-                        "direct_fit_3 必须包含 R/G/B 三个 decoder")
+            if len(channel_decoder_weights)!=3 \
+                    or len(channel_decoder_biases)!=3:
+                raise ValueError(
+                    f"{self.background_method} 必须包含 R/G/B 三个独立 head")
+            if self.background_method=="direct_fit_3":
+                decoder_input_count=(2+4*frequencies.size+latent_count
+                                     +pca_components.shape[1]
+                                     +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT)
                 for channel,weights,biases in zip(
                         CHANNELS,channel_decoder_weights,
                         channel_decoder_biases,strict=True):
-                    validate_decoder(
-                        weights,biases,1,f"direct_fit_3 {channel} decoder")
+                    previous=decoder_input_count
+                    for index,(weight,layer_bias) in enumerate(zip(
+                            weights,biases,strict=True)):
+                        if weight.ndim!=2 or weight.shape[0]!=previous \
+                                or layer_bias.shape!=(weight.shape[1],) \
+                                or not np.isfinite(weight).all() \
+                                or not np.isfinite(layer_bias).all() \
+                                or (index==len(weights)-1
+                                    and weight.shape[1]!=1):
+                            raise ValueError(
+                                f"direct_fit_3 {channel} decoder 层尺寸无效")
+                        previous=weight.shape[1]+decoder_input_count
+            else:
+                gru_input=np.asarray(self.direct_s_gru_input_weight)
+                gru_recurrent=np.asarray(self.direct_s_gru_recurrent_weight)
+                gru_bias=np.asarray(self.direct_s_gru_bias)
+                warp_weight=np.asarray(self.direct_s_warp_weight)
+                warp_bias=np.asarray(self.direct_s_warp_bias)
+                trunk_weights=tuple(np.asarray(value) for value in (
+                    self.direct_s_color_trunk_weights or ()))
+                trunk_biases=tuple(np.asarray(value) for value in (
+                    self.direct_s_color_trunk_biases or ()))
+                if gru_input.ndim!=2 or gru_input.shape[0]!=latent_count \
+                        or gru_input.shape[1]%3!=0:
+                    raise ValueError("direct_fit_s GRU 输入权重尺寸无效")
+                hidden_count=gru_input.shape[1]//3
+                if gru_recurrent.shape!=(hidden_count,3*hidden_count) \
+                        or gru_bias.shape!=(3*hidden_count,) \
+                        or warp_weight.shape!=(hidden_count,3) \
+                        or warp_bias.shape!=(3,) \
+                        or not all(np.isfinite(value).all() for value in (
+                            gru_input,gru_recurrent,gru_bias,warp_weight,
+                            warp_bias)):
+                    raise ValueError("direct_fit_s GRU/warp 权重尺寸无效")
+                color_input_count=(2+4*frequencies.size+latent_count
+                                   +pca_components.shape[1]
+                                   +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT
+                                   +hidden_count)
+                if not trunk_weights or len(trunk_weights)!=len(trunk_biases):
+                    raise ValueError("direct_fit_s 共享颜色 trunk 无效")
+                previous=color_input_count
+                for weight,layer_bias in zip(
+                        trunk_weights,trunk_biases,strict=True):
+                    if weight.ndim!=2 or weight.shape[0]!=previous \
+                            or layer_bias.shape!=(weight.shape[1],) \
+                            or not np.isfinite(weight).all() \
+                            or not np.isfinite(layer_bias).all():
+                        raise ValueError("direct_fit_s 颜色 trunk 层尺寸无效")
+                    previous=weight.shape[1]+color_input_count
+                trunk_width=trunk_weights[-1].shape[1]
+                for channel,weights,biases in zip(
+                        CHANNELS,channel_decoder_weights,
+                        channel_decoder_biases,strict=True):
+                    previous=trunk_width+color_input_count
+                    for index,(weight,layer_bias) in enumerate(zip(
+                            weights,biases,strict=True)):
+                        if weight.ndim!=2 or weight.shape[0]!=previous \
+                                or layer_bias.shape!=(weight.shape[1],) \
+                                or not np.isfinite(weight).all() \
+                                or not np.isfinite(layer_bias).all() \
+                                or (index==len(weights)-1
+                                    and weight.shape[1]!=1):
+                            raise ValueError(
+                                f"direct_fit_s {channel} head 层尺寸无效")
+                        previous=weight.shape[1]+color_input_count
             data.update({
                 "direct_session_correction_mode":"additive_bspline",
                 "direct_base_mode":"robust_full_resolution_texture",
@@ -921,83 +883,29 @@ class LightFieldModel:
                     value.tolist() for value in encoder_weights],
                 "direct_geometry_encoder_biases":[
                     value.tolist() for value in encoder_biases]})
-            if self.background_method=="direct_fit":
-                data.update({
-                    "direct_decoder_weights":[
-                        value.tolist() for value in decoder_weights],
-                    "direct_decoder_biases":[
-                        value.tolist() for value in decoder_biases]})
-            else:
-                data.update({
-                    "direct_base_channel_mode":"independent_huber",
-                    "direct_channel_decoder_order":list(CHANNELS),
-                    "direct_channel_decoder_weights":[
-                        [value.tolist() for value in decoder]
-                        for decoder in channel_decoder_weights],
-                    "direct_channel_decoder_biases":[
-                        [value.tolist() for value in decoder]
-                        for decoder in channel_decoder_biases]})
-        else:
-            # 用构造器复用全部尺寸/数值校验，再保存明确的缓存插值语义。
-            validated=LightFieldModel.geometry_cache(
-                residual_b,
-                base_texture=np.asarray(self.geometry_cache_base_texture),
-                anchor_coefficients=np.asarray(
-                    self.geometry_cache_anchor_coefficients),
-                descriptor_mean=np.asarray(
-                    self.geometry_cache_descriptor_mean),
-                descriptor_scale=np.asarray(
-                    self.geometry_cache_descriptor_scale),
-                pca_components=np.asarray(
-                    self.geometry_cache_pca_components),
-                pca_scale=np.asarray(self.geometry_cache_pca_scale),
-                anchor_keys=np.asarray(self.geometry_cache_anchor_keys),
-                curve_coefficients=self.geometry_cache_curve_coefficients,
-                descriptor_huber_delta=(
-                    self.geometry_cache_descriptor_huber_delta),
-                interpolation_neighbors=(
-                    self.geometry_cache_interpolation_neighbors),
-                distance_power=self.geometry_cache_distance_power,
-                distance_epsilon=self.geometry_cache_distance_epsilon,
-                curve_convexity=self.direct_curve_convexity,
-                reconstruction_pipeline=self.direct_reconstruction_pipeline,
-                source_layout=source_layout)
             data.update({
-                "geometry_cache_session_correction_mode":"additive_bspline",
-                "geometry_cache_mode":"nearest_anchor_convex_interpolation",
-                "geometry_cache_base_axis_order":[
-                    "surface_row","surface_column","RGB"],
-                "geometry_cache_base_texture":np.asarray(
-                    validated.geometry_cache_base_texture).tolist(),
-                "geometry_cache_anchor_axis_order":[
-                    "anchor","RGB","surface_row","surface_column"],
-                "geometry_cache_anchor_bspline_coefficients":np.asarray(
-                    validated.geometry_cache_anchor_coefficients).tolist(),
-                "geometry_cache_descriptor_basis":"robust_centerline_bspline",
-                "geometry_cache_curve_coefficients":(
-                    validated.geometry_cache_curve_coefficients),
-                "geometry_cache_descriptor_huber_delta_mm":(
-                    validated.geometry_cache_descriptor_huber_delta),
-                "geometry_cache_descriptor_mean":np.asarray(
-                    validated.geometry_cache_descriptor_mean).tolist(),
-                "geometry_cache_descriptor_scale":np.asarray(
-                    validated.geometry_cache_descriptor_scale).tolist(),
-                "geometry_cache_pca_components":np.asarray(
-                    validated.geometry_cache_pca_components).tolist(),
-                "geometry_cache_pca_scale":np.asarray(
-                    validated.geometry_cache_pca_scale).tolist(),
-                "geometry_cache_anchor_keys":np.asarray(
-                    validated.geometry_cache_anchor_keys).tolist(),
-                "geometry_cache_interpolation_neighbors":(
-                    validated.geometry_cache_interpolation_neighbors),
-                "geometry_cache_distance_power":(
-                    validated.geometry_cache_distance_power),
-                "geometry_cache_distance_epsilon":(
-                    validated.geometry_cache_distance_epsilon),
-                "geometry_cache_curve_convexity":(
-                    validated.direct_curve_convexity),
-                "geometry_cache_reconstruction_pipeline":(
-                    validated.direct_reconstruction_pipeline)})
+                "direct_base_channel_mode":"independent_huber",
+                "direct_channel_decoder_order":list(CHANNELS),
+                "direct_channel_decoder_weights":[
+                    [value.tolist() for value in decoder]
+                    for decoder in channel_decoder_weights],
+                "direct_channel_decoder_biases":[
+                    [value.tolist() for value in decoder]
+                    for decoder in channel_decoder_biases]})
+            if self.background_method=="direct_fit_s":
+                data.update({
+                    "direct_recurrent_mode":"single_gru",
+                    "direct_s_gru_gate_order":["update","reset","candidate"],
+                    "direct_warp_mode":"affine_s_softmax_interval",
+                    "direct_s_gru_input_weight":gru_input.tolist(),
+                    "direct_s_gru_recurrent_weight":gru_recurrent.tolist(),
+                    "direct_s_gru_bias":gru_bias.tolist(),
+                    "direct_s_warp_weight":warp_weight.tolist(),
+                    "direct_s_warp_bias":warp_bias.tolist(),
+                    "direct_s_color_trunk_weights":[
+                        value.tolist() for value in trunk_weights],
+                    "direct_s_color_trunk_biases":[
+                        value.tolist() for value in trunk_biases]})
         temporary = output.with_suffix(output.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as stream:
             yaml.safe_dump(data, stream, allow_unicode=True, sort_keys=False)
@@ -1294,40 +1202,8 @@ def direct_geometry_descriptor_jax(xyz: Array,descriptor_rows: int = 16) -> Arra
         sampled_width.reshape(-1),mean_normals.reshape(-1)])
 
 
-def geometry_cache_descriptor_jax(
-    xyz: Array,curve_coefficients: int = 12,huber_delta: float = .5,
-) -> Array:
-    """用鲁棒低频中心线/宽度样条描述整体弯曲，抑制局部接触突变。"""
-    if curve_coefficients<4 or curve_coefficients>xyz.shape[0] \
-            or huber_delta<=0:
-        raise ValueError("geometry_cache descriptor 参数无效")
-    centerline=jnp.mean(xyz,axis=1)
-    width=jnp.linalg.norm(xyz[:,-1]-xyz[:,0],axis=-1,keepdims=True)
-    targets=jnp.concatenate([centerline,width],axis=-1)
-    basis=bspline_basis(
-        jnp.linspace(0.,1.,xyz.shape[0],dtype=xyz.dtype),curve_coefficients)
-    second=basis[:-2]-2*basis[1:-1]+basis[2:]
-    regularization=(.01*(second.T@second)/max(second.shape[0],1)
-                    +1e-7*jnp.eye(curve_coefficients,dtype=xyz.dtype))
-
-    def solve(weight: Array) -> Array:
-        normal=jnp.einsum("hr,h,hs->rs",basis,weight,basis) \
-            /jnp.maximum(jnp.sum(weight),1.)+regularization
-        rhs=jnp.einsum("hr,h,hd->rd",basis,weight,targets) \
-            /jnp.maximum(jnp.sum(weight),1.)
-        return jnp.linalg.solve(normal,rhs)
-
-    coefficients=solve(jnp.ones((xyz.shape[0],),xyz.dtype))
-    for _ in range(5):
-        error=targets-jnp.einsum("hr,rd->hd",basis,coefficients)
-        distance=jnp.sqrt(jnp.sum(error[...,:3]**2,axis=-1)
-                          +error[...,3]**2+1e-12)
-        coefficients=solve(jnp.minimum(1.,huber_delta/distance))
-    return coefficients.reshape(-1)
-
-
 def direct_local_geometry_feature_grid_jax(xyz: Array) -> Array:
-    """为每个曲面顶点构造保留空间结构的 15 维局部几何特征。"""
+    """为每个曲面顶点构造 10 维、无结构零项的局部几何特征。"""
     centerline=jnp.mean(xyz,axis=1)
     segment=centerline[1:]-centerline[:-1]
     tangent_inner=centerline[2:]-centerline[:-2]
@@ -1350,8 +1226,12 @@ def direct_local_geometry_feature_grid_jax(xyz: Array) -> Array:
     curvature_grid=jnp.broadcast_to(
         curvature[:,None,:],(xyz.shape[0],columns,3))
     lateral=xyz-centerline[:,None,:]
+    # 当前直纹面模型中 normal/tangent/curvature 的 X 分量严格为零，
+    # lateral 的 Y/Z 分量也严格为零。保留它们只会把浮点噪声除以极小标准差，
+    # 让解码器把重建数值噪声误当成光照状态。
     return jnp.concatenate([
-        xyz,surface_normals(xyz),tangent_grid,curvature_grid,lateral],axis=-1)
+        xyz,surface_normals(xyz)[...,1:],tangent_grid[...,1:],
+        curvature_grid[...,1:],lateral[...,:1]],axis=-1)
 
 
 def direct_local_geometry_features_jax(
@@ -1424,18 +1304,15 @@ def direct_background_rgb_jax(
     coordinates: Array,xyz: Array,model: LightFieldModel,
 ) -> Array:
     """以 sigmoid(logit(B)+delta B) 求值几何条件绝对线性 RGB。"""
-    if model.background_method not in DIRECT_BACKGROUND_METHODS \
+    if model.background_method!="direct_fit_3" \
             or model.direct_base_texture is None \
             or model.direct_coordinate_frequencies is None \
             or model.direct_local_geometry_feature_mean is None \
             or model.direct_local_geometry_feature_scale is None \
-            or (model.background_method=="direct_fit" and (
-                model.direct_decoder_weights is None
-                or model.direct_decoder_biases is None)) \
             or (model.background_method=="direct_fit_3" and (
                 model.direct_channel_decoder_weights is None
                 or model.direct_channel_decoder_biases is None)):
-        raise ValueError("当前模型不包含 direct_fit 几何条件神经场")
+        raise ValueError("当前模型不包含 direct_fit_3 几何条件神经场")
     latent,pca=direct_geometry_conditions_jax(xyz,model)
     coordinate_features=direct_background_features_jax(
         coordinates,model.direct_coordinate_frequencies)
@@ -1461,20 +1338,14 @@ def direct_background_rgb_jax(
                 values=jax.nn.silu(values)
         return values
 
-    if model.background_method=="direct_fit":
-        assert model.direct_decoder_weights is not None
-        assert model.direct_decoder_biases is not None
-        values=decode(
-            model.direct_decoder_weights,model.direct_decoder_biases)
-    else:
-        assert model.direct_channel_decoder_weights is not None
-        assert model.direct_channel_decoder_biases is not None
-        values=jnp.concatenate([
-            decode(weights,biases)
-            for weights,biases in zip(
-                model.direct_channel_decoder_weights,
-                model.direct_channel_decoder_biases,strict=True)
-        ],axis=-1)
+    assert model.direct_channel_decoder_weights is not None
+    assert model.direct_channel_decoder_biases is not None
+    values=jnp.concatenate([
+        decode(weights,biases)
+        for weights,biases in zip(
+            model.direct_channel_decoder_weights,
+            model.direct_channel_decoder_biases,strict=True)
+    ],axis=-1)
     base=sample_direct_base_texture_jax(
         model.direct_base_texture,coordinates)
     epsilon=jnp.asarray(1e-4,base.dtype)
@@ -1491,6 +1362,129 @@ def direct_background_field_jax(
     s,t=jnp.meshgrid(
         jnp.linspace(0.,1.,rows),jnp.linspace(0.,1.,columns),indexing="ij")
     return direct_background_rgb_jax(jnp.stack([s,t],axis=-1),xyz,model)
+
+
+def direct_s_recurrent_step_jax(
+    raw_observed_xyz: Array,previous_hidden: Array,model: LightFieldModel,
+) -> tuple[Array,Array,Array,Array]:
+    """用归一化前的观测几何推进 GRU，并返回 [left,visible,right]。"""
+    required=(model.direct_s_gru_input_weight,
+              model.direct_s_gru_recurrent_weight,
+              model.direct_s_gru_bias,model.direct_s_warp_weight,
+              model.direct_s_warp_bias)
+    if model.background_method!="direct_fit_s" \
+            or any(value is None for value in required):
+        raise ValueError("当前模型不包含 direct_fit_s GRU/warp")
+    latent,pca=direct_geometry_conditions_jax(raw_observed_xyz,model)
+    assert model.direct_s_gru_input_weight is not None
+    assert model.direct_s_gru_recurrent_weight is not None
+    assert model.direct_s_gru_bias is not None
+    input_gates=(latent@model.direct_s_gru_input_weight
+                 +model.direct_s_gru_bias)
+    recurrent_gates=previous_hidden@model.direct_s_gru_recurrent_weight
+    input_update,input_reset,input_candidate=jnp.split(input_gates,3,axis=-1)
+    recurrent_update,recurrent_reset,recurrent_candidate=jnp.split(
+        recurrent_gates,3,axis=-1)
+    update=jax.nn.sigmoid(input_update+recurrent_update)
+    reset=jax.nn.sigmoid(input_reset+recurrent_reset)
+    candidate_input=input_candidate+reset*recurrent_candidate
+    candidate=jnp.tanh(candidate_input)
+    hidden=update*previous_hidden+(1-update)*candidate
+    assert model.direct_s_warp_weight is not None
+    assert model.direct_s_warp_bias is not None
+    interval=jax.nn.softmax(
+        hidden@model.direct_s_warp_weight+model.direct_s_warp_bias,axis=-1)
+    return hidden,interval,latent,pca
+
+
+def direct_s_warp_coordinates_jax(
+    coordinates: Array,interval: Array,
+) -> Array:
+    """把观测坐标 s 仿射映射到隐式材料区间；t 保持不变。"""
+    start=interval[...,0]
+    visible=interval[...,1]
+    warped_s=start+visible*coordinates[...,0]
+    return jnp.stack([warped_s,coordinates[...,1]],axis=-1)
+
+
+def direct_s_background_rgb_jax(
+    coordinates: Array,surface_xyz: Array,raw_observed_xyz: Array,
+    hidden: Array,interval: Array,model: LightFieldModel,
+) -> Array:
+    """求值带单调仿射 s-warp、共享 trunk 和独立 RGB head 的背景。"""
+    required=(model.direct_base_texture,model.direct_coordinate_frequencies,
+              model.direct_local_geometry_feature_mean,
+              model.direct_local_geometry_feature_scale,
+              model.direct_s_color_trunk_weights,
+              model.direct_s_color_trunk_biases,
+              model.direct_channel_decoder_weights,
+              model.direct_channel_decoder_biases)
+    if model.background_method!="direct_fit_s" \
+            or any(value is None for value in required):
+        raise ValueError("当前模型不包含 direct_fit_s 颜色网络")
+    latent,pca=direct_geometry_conditions_jax(raw_observed_xyz,model)
+    warped=direct_s_warp_coordinates_jax(coordinates,interval)
+    assert model.direct_coordinate_frequencies is not None
+    coordinate_features=direct_background_features_jax(
+        warped,model.direct_coordinate_frequencies)
+    assert model.direct_local_geometry_feature_mean is not None
+    assert model.direct_local_geometry_feature_scale is not None
+    local=(direct_local_geometry_features_jax(surface_xyz,coordinates)
+           -model.direct_local_geometry_feature_mean) \
+        /model.direct_local_geometry_feature_scale
+
+    def broadcast(value: Array) -> Array:
+        return jnp.broadcast_to(
+            value,(*coordinate_features.shape[:-1],value.shape[-1]))
+
+    network_input=jnp.concatenate([
+        coordinate_features,broadcast(latent),broadcast(pca),local,
+        broadcast(hidden)],axis=-1)
+    values=network_input
+    assert model.direct_s_color_trunk_weights is not None
+    assert model.direct_s_color_trunk_biases is not None
+    for index,(weight,bias) in enumerate(zip(
+            model.direct_s_color_trunk_weights,
+            model.direct_s_color_trunk_biases,strict=True)):
+        if index>0:
+            values=jnp.concatenate([values,network_input],axis=-1)
+        values=jax.nn.silu(values@weight+bias)
+    trunk=values
+
+    def head(weights: tuple[Array,...],biases: tuple[Array,...]) -> Array:
+        current=jnp.concatenate([trunk,network_input],axis=-1)
+        for index,(weight,bias) in enumerate(zip(weights,biases,strict=True)):
+            if index>0:
+                current=jnp.concatenate([current,network_input],axis=-1)
+            current=current@weight+bias
+            if index<len(weights)-1:
+                current=jax.nn.silu(current)
+        return current
+
+    assert model.direct_channel_decoder_weights is not None
+    assert model.direct_channel_decoder_biases is not None
+    delta=jnp.concatenate([
+        head(weights,biases) for weights,biases in zip(
+            model.direct_channel_decoder_weights,
+            model.direct_channel_decoder_biases,strict=True)],axis=-1)
+    assert model.direct_base_texture is not None
+    base=sample_direct_base_texture_jax(model.direct_base_texture,warped)
+    epsilon=jnp.asarray(1e-4,base.dtype)
+    base=jnp.clip(base,epsilon,1-epsilon)
+    return jax.nn.sigmoid(jnp.log(base)-jnp.log1p(-base)+delta)
+
+
+def direct_s_background_field_jax(
+    grid_shape: tuple[int,int],surface_xyz: Array,raw_observed_xyz: Array,
+    hidden: Array,interval: Array,model: LightFieldModel,
+) -> Array:
+    """把当前 direct_fit_s 序列状态展开成观测坐标下的背景纹理。"""
+    rows,columns=grid_shape
+    s,t=jnp.meshgrid(
+        jnp.linspace(0.,1.,rows),jnp.linspace(0.,1.,columns),indexing="ij")
+    coordinates=jnp.stack([s,t],axis=-1)
+    return direct_s_background_rgb_jax(
+        coordinates,surface_xyz,raw_observed_xyz,hidden,interval,model)
 
 
 def direct_background_field_chunked(
@@ -1521,64 +1515,6 @@ def direct_background_field_chunked(
         parts.append(np.asarray(evaluate(chunk,xyz_gpu,model_gpu)))
     return np.concatenate(parts,axis=0).reshape(rows,columns,3)
 
-
-def geometry_cache_background_field_jax(
-    grid_shape: tuple[int,int],xyz: Array,model: LightFieldModel,
-) -> Array:
-    """从当前整体几何在最近缓存锚点间凸插值得到完整 RGB 背景。"""
-    required=(model.geometry_cache_base_texture,
-              model.geometry_cache_anchor_coefficients,
-              model.geometry_cache_descriptor_mean,
-              model.geometry_cache_descriptor_scale,
-              model.geometry_cache_pca_components,
-              model.geometry_cache_pca_scale,
-              model.geometry_cache_anchor_keys)
-    if model.background_method!="geometry_cache" or any(
-            value is None for value in required):
-        raise ValueError("当前模型不包含 geometry_cache 背景")
-    assert model.geometry_cache_descriptor_mean is not None
-    assert model.geometry_cache_descriptor_scale is not None
-    assert model.geometry_cache_pca_components is not None
-    assert model.geometry_cache_pca_scale is not None
-    assert model.geometry_cache_anchor_keys is not None
-    assert model.geometry_cache_anchor_coefficients is not None
-    assert model.geometry_cache_base_texture is not None
-    descriptor=geometry_cache_descriptor_jax(
-        xyz,model.geometry_cache_curve_coefficients,
-        model.geometry_cache_descriptor_huber_delta)
-    normalized=(descriptor-model.geometry_cache_descriptor_mean) \
-        /model.geometry_cache_descriptor_scale
-    key=(normalized@model.geometry_cache_pca_components) \
-        /model.geometry_cache_pca_scale
-    squared_distance=jnp.sum(
-        (model.geometry_cache_anchor_keys-key[None])**2,axis=-1)
-    negative_distance,indices=jax.lax.top_k(
-        -squared_distance,model.geometry_cache_interpolation_neighbors)
-    distance=jnp.sqrt(jnp.maximum(-negative_distance,0))
-    weight=(distance+model.geometry_cache_distance_epsilon) \
-        **(-model.geometry_cache_distance_power)
-    weight/=jnp.sum(weight)
-    coefficients=jnp.einsum(
-        "a,akrc->krc",weight,
-        model.geometry_cache_anchor_coefficients[indices])
-    correction=rgb_bspline_field(grid_shape,coefficients)
-    rows,columns=grid_shape
-    s,t=jnp.meshgrid(
-        jnp.linspace(0.,1.,rows),jnp.linspace(0.,1.,columns),indexing="ij")
-    base=sample_direct_base_texture_jax(
-        model.geometry_cache_base_texture,jnp.stack([s,t],axis=-1))
-    return jnp.clip(base+correction,0,1)
-
-
-def geometry_background_field_jax(
-    grid_shape: tuple[int,int],xyz: Array,model: LightFieldModel,
-) -> Array:
-    """统一求值神经场或几何锚点缓存背景。"""
-    if model.background_method in DIRECT_BACKGROUND_METHODS:
-        return direct_background_field_jax(grid_shape,xyz,model)
-    if model.background_method=="geometry_cache":
-        return geometry_cache_background_field_jax(grid_shape,xyz,model)
-    raise ValueError("当前模型不是几何条件背景模式")
 
 @partial(jax.jit,static_argnames=(
     "row_coefficients","column_coefficients","max_iterations"))

@@ -11,7 +11,6 @@ import cv2
 import jax
 import jax.numpy as jnp
 import numpy as np
-import yaml
 from scipy.spatial import cKDTree
 
 from calibrate_lightfield import (
@@ -29,10 +28,10 @@ from manual_norm_regions import (
     save_manual_ellipses,
 )
 from recon import NormalCalibration
-from utils.config import (GEOMETRY_BACKGROUND_METHODS,file_sha256,
+from utils.config import (DIRECT_BACKGROUND_METHODS,file_sha256,load_config,
                           parse_background_method,
-                          parse_direct_fit_config,
-                          parse_geometry_cache_config,
+                          parse_direct_fit_3_config,
+                          parse_direct_fit_s_config,
                           parse_reconstruction_config,
                           resolve_background_model_path,resolve_method_path)
 from utils.lightfield import (
@@ -40,7 +39,9 @@ from utils.lightfield import (
     bgr_to_linear_rgb_jax,
     build_canonical_residual_sample_jax,
     choose_device,
-    geometry_background_field_jax,
+    direct_background_field_jax,
+    direct_s_background_field_jax,
+    direct_s_recurrent_step_jax,
     erode_mask_jax,
     fit_startup_residual_bsession_model,
     fit_startup_direct_bsession_model,
@@ -470,29 +471,39 @@ def _make_residual_renderer(
     runtime=lightfield_cfg["runtime"]; irls=lightfield_cfg["irls"]
     calibration=lightfield_cfg["calibration"]
     sigma=jax.device_put(jnp.asarray(irls["sigma_rgb"],jnp.float32),device)
-    nodes=int(lightfield_cfg["integration_nodes"])
-    epsilon=float(lightfield_cfg["distance_epsilon_mm"])
+    nodes=int(lightfield_cfg.get("integration_nodes",48))
+    epsilon=float(lightfield_cfg.get("distance_epsilon_mm",.05))
     cg_tolerance=float(lightfield_cfg.get("diffusion_cg_tolerance",1e-4))
     cg_iterations=int(lightfield_cfg.get("diffusion_cg_max_iterations",30))
     raster_chunk=int(runtime.get("gpu_raster_triangle_chunk",64))
-    raster_width=int(runtime.get("gpu_raster_max_triangle_width",128))
-    raster_height=int(runtime.get("gpu_raster_max_triangle_height",64))
+    # 与 calibrate_lightfield 的规范采样使用同一安全下限。配置中的旧网格
+    # 容量可能小于当前 120x52 曲面的实际三角形包围盒；overflow 必须继续
+    # 严格拒绝，但不能因两条标定路径采用不同容量而产生伪失败。
+    raster_width=max(
+        int(runtime.get("gpu_raster_max_triangle_width",128)),64)
+    raster_height=max(
+        int(runtime.get("gpu_raster_max_triangle_height",64)),32)
     erode_pixels=int(runtime.get("difference_erode_pixels",4))
     session_saturation=int(calibration.get("saturation_threshold",250))
     session_erode_pixels=int(calibration.get("residual_erode_pixels",6))
-    if model.background_method in GEOMETRY_BACKGROUND_METHODS:
-        sample_config=(parse_geometry_cache_config(lightfield_cfg)
-                       if model.background_method=="geometry_cache" else
-                       parse_direct_fit_config(lightfield_cfg))
-        session_saturation=sample_config.sample_saturation_threshold
+    if model.background_method in DIRECT_BACKGROUND_METHODS:
+        sample_config=(
+            parse_direct_fit_3_config(lightfield_cfg)
+            if model.background_method=="direct_fit_3"
+            else parse_direct_fit_s_config(lightfield_cfg))
+        session_saturation=255
         session_erode_pixels=sample_config.sample_erode_pixels
+    direct_s_online_gain_bias=(
+        sample_config.online_gain_bias_enabled
+        if model.background_method=="direct_fit_s" else True)
     score_huber_delta=float(runtime.get("residual_score_huber_delta",.04))
     score_huber_iterations=int(runtime.get("residual_score_huber_iterations",5))
     if score_huber_delta<=0 or score_huber_iterations<1:
         raise ValueError("runtime residual_score_huber 参数无效")
 
     @jax.jit
-    def render(frame_bgr,xyz,uv,st,camera_depth,b_texture,m_textures):
+    def render(frame_bgr,xyz,raw_xyz,uv,st,camera_depth,b_texture,m_textures,
+               previous_direct_s_hidden):
         frame_linear=bgr_to_linear_rgb_jax(frame_bgr)
         if model.background_method=="physical_residual":
             observed=sample_linear_rgb_jax(frame_linear,uv)
@@ -508,8 +519,8 @@ def _make_residual_renderer(
                 jnp.ones(3,jnp.float32))
             colors=jnp.clip(gain*physical+bias,0,1)
         else:
-            # direct 的 gain/bias 在神经背景投影到图像域后拟合；这里的占位通道
-            # 仅用于保持后续光栅属性布局一致。
+            # direct 神经背景在投影到图像域后处理；这里的占位通道只用于保持
+            # 后续光栅属性布局一致。direct_fit_s 默认不会再拟合 gain/bias。
             gain=jnp.ones(3,jnp.float32)
             bias=jnp.zeros(3,jnp.float32)
             weights=jnp.ones(uv.shape[:-1],jnp.float32)
@@ -526,20 +537,35 @@ def _make_residual_renderer(
             correction_target=frame_linear-background
         b_image,m_images=sample_residual_correction_jax(
             coordinate_image,b_texture,m_textures,valid)
-        if model.background_method in GEOMETRY_BACKGROUND_METHODS:
-            neural_texture=geometry_background_field_jax(
-                b_texture.shape[:2],xyz,model)
+        if model.background_method in DIRECT_BACKGROUND_METHODS:
+            if model.background_method=="direct_fit_s":
+                direct_s_hidden,direct_s_interval,_,_=direct_s_recurrent_step_jax(
+                    raw_xyz,previous_direct_s_hidden,model)
+                neural_texture=direct_s_background_field_jax(
+                    b_texture.shape[:2],xyz,raw_xyz,direct_s_hidden,
+                    direct_s_interval,model)
+            else:
+                direct_s_hidden=previous_direct_s_hidden
+                neural_texture=direct_background_field_jax(
+                    b_texture.shape[:2],xyz,model)
             neural_image,_=sample_residual_correction_jax(
                 coordinate_image,neural_texture,m_textures[:0],valid)
-            gain,bias,weights=irls_gain_bias(
-                frame_linear-b_image,neural_image,
-                jnp.zeros(3,jnp.float32),sigma,
-                int(irls["iterations"]),float(irls["lambda_gain"]),
-                float(irls["lambda_bias"]),
-                float(irls["max_gain_deviation"]),
-                float(irls["max_bias_deviation"]),
-                jnp.ones(3,jnp.float32),valid_mask=valid)
-            adjusted_neural=jnp.clip(gain*neural_image+bias,0,1)
+            if model.background_method=="direct_fit_s" \
+                    and not direct_s_online_gain_bias:
+                gain=jnp.ones((3,),jnp.float32)
+                bias=jnp.zeros((3,),jnp.float32)
+                weights=valid.astype(jnp.float32)
+                adjusted_neural=neural_image
+            else:
+                gain,bias,weights=irls_gain_bias(
+                    frame_linear-b_image,neural_image,
+                    jnp.zeros(3,jnp.float32),sigma,
+                    int(irls["iterations"]),float(irls["lambda_gain"]),
+                    float(irls["lambda_bias"]),
+                    float(irls["max_gain_deviation"]),
+                    float(irls["max_bias_deviation"]),
+                    jnp.ones(3,jnp.float32),valid_mask=valid)
+                adjusted_neural=jnp.clip(gain*neural_image+bias,0,1)
             background=jnp.clip(adjusted_neural+b_image,0,1)
             correction_target=frame_linear-adjusted_neural
         canonical_residual,canonical_valid=(
@@ -549,7 +575,7 @@ def _make_residual_renderer(
                 erode_pixels=session_erode_pixels))
         # 人工椭圆最终仍只与几何/投影有效域相交；不再进行自动色差筛选。
         difference_valid=erode_mask_jax(valid,erode_pixels)
-        if model.background_method in GEOMETRY_BACKGROUND_METHODS:
+        if model.background_method in DIRECT_BACKGROUND_METHODS:
             scores=jnp.ones((3,1),jnp.float32)
             fitted=background
         elif residual_method=="uniform":
@@ -565,12 +591,14 @@ def _make_residual_renderer(
         # 人工区域内的 LUT 采样和在线局部重建共享同一个有符号色差定义。
         cleaned_difference=(frame_linear-fitted
                             if model.background_method in
-                            GEOMETRY_BACKGROUND_METHODS else
+                            DIRECT_BACKGROUND_METHODS else
                             correction_target-fitted)
         cleaned=jnp.where(
             difference_valid[...,None],cleaned_difference,0)
+        if model.background_method!="direct_fit_s":
+            direct_s_hidden=previous_direct_s_hidden
         return (cleaned,difference_valid,valid,xyz_image,overflow,gain,bias,
-                scores,canonical_residual,canonical_valid)
+                scores,canonical_residual,canonical_valid,direct_s_hidden)
 
     return render
 
@@ -599,10 +627,11 @@ def fit_normal_calibration_residual_session(
             runtime.get("residual_channel_huber_ratio_max",2.)),
     }
     if getattr(model,"background_method","physical_residual") in \
-            GEOMETRY_BACKGROUND_METHODS:
-        session_config=(parse_geometry_cache_config(lightfield_cfg)
-                        if model.background_method=="geometry_cache" else
-                        parse_direct_fit_config(lightfield_cfg))
+            DIRECT_BACKGROUND_METHODS:
+        session_config=(
+            parse_direct_fit_3_config(lightfield_cfg)
+            if model.background_method=="direct_fit_3"
+            else parse_direct_fit_s_config(lightfield_cfg))
         b_coefficients,scores,channel_huber,diagnostics=(
             fit_startup_direct_bsession_model(
                 canonical_residuals,canonical_valid,
@@ -630,6 +659,18 @@ def _resolve_output(path_value: str,base: Path) -> Path:
     return path if path.is_absolute() else base/path
 
 
+def _resolve_optional_output(
+    path_value: str | Path | None,
+    base: Path,
+    field_name: str = "normal_calibration diagnostic directory",
+) -> Path | None:
+    if path_value is None:
+        return None
+    if not isinstance(path_value,(str,Path)):
+        raise ValueError(f"{field_name} 必须是路径字符串或 null")
+    return _resolve_output(str(path_value),base)
+
+
 def main() -> None:
     parser=argparse.ArgumentParser(description="用人工椭圆标定球建立颜色差分到局部坡度标定")
     parser.add_argument("--config",default=Path(__file__).with_name("config.yaml"))
@@ -638,7 +679,7 @@ def main() -> None:
         help="重新逐张打开人工椭圆编辑器；默认仅编辑缺失标注")
     args=parser.parse_args()
     config_path=Path(args.config).expanduser()
-    all_config=yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    all_config=load_config(config_path)
     raw=all_config.get("normal_calibration")
     if not isinstance(raw,dict):
         raise ValueError("config.yaml 缺少 normal_calibration 配置段")
@@ -660,6 +701,18 @@ def main() -> None:
     verification_dir=_resolve_output(
         raw.get("verification_dir","assets/normal_calibration/verification"),
         config_path.parent)
+    material_diagnostic_dir=_resolve_optional_output(
+        raw.get(
+            "material_initialization_diagnostic_dir",
+            "assets/normal_calibration/material_initialization_failures"),
+        config_path.parent,
+        "normal_calibration.material_initialization_diagnostic_dir")
+    material_update_diagnostic_dir=_resolve_optional_output(
+        raw.get(
+            "material_update_failure_diagnostic_dir",
+            "assets/normal_calibration/material_update_failures"),
+        config_path.parent,
+        "normal_calibration.material_update_failure_diagnostic_dir")
     manual_regions_path=_resolve_output(
         raw.get("manual_regions_file",
                 "assets/normal_calibration/manual_ellipses.yaml"),
@@ -684,6 +737,17 @@ def main() -> None:
     reconstruction=parse_reconstruction_config(
         surface.get("reconstruction"),config_path=config_path,
         calibration_output=all_config.get("calibration",{}).get("output"))
+    model_path=resolve_background_model_path(
+        lightfield_cfg,method=background_method,base=config_path.parent)
+    if not model_path.is_file():
+        checkpoint=model_path.with_suffix(".best_ckpt.npz")
+        checkpoint_text=(
+            f"；发现完整训练检查点 {checkpoint}，但最终 YAML 尚未生成"
+            if checkpoint.is_file() else "；同时未发现最佳训练检查点")
+        raise FileNotFoundError(
+            f"法向标定依赖的 {background_method} 光场模型不存在: "
+            f"{model_path}{checkpoint_text}。请先成功完成 "
+            "calibrate_lightfield.py，再运行 calibrate_norm.py")
     session_sample_shape=(
         reconstruction.observation_rows,reconstruction.observation_columns)
     residual_texture_shape=(
@@ -691,7 +755,11 @@ def main() -> None:
         reconstruction.residual_texture_columns)
     observations=reconstruct_all_observations(
         paths,all_config,config_path,observation_dir,map_dir,
-        filter_original_saturation=False)
+        filter_original_saturation=False,
+        material_initialization_diagnostic_dir=material_diagnostic_dir,
+        material_update_failure_diagnostic_dir=
+            material_update_diagnostic_dir,
+        independent_material_sequence_id="normal_calibration_images")
     # 无效帧按实时部署语义被拒绝；后续依据成功缓存中的源图重新配对。
     observation_sources=[]
     for observation_path in observations:
@@ -706,19 +774,23 @@ def main() -> None:
         raise ValueError(
             "local_reconstruction.residual_method 必须是 "
             "uniform 或 uniform_huber")
-    model_path=resolve_background_model_path(
-        lightfield_cfg,method=background_method,base=config_path.parent)
     device=choose_device(lightfield_cfg.get("device","gpu"))
     model=LightFieldModel.load(model_path,device)
+    material_template=reconstruction.material_template
+    if model.material_template_sha256!=material_template.sha256:
+        raise ValueError(
+            "光场模型与法向标定使用的材料模板不一致；请重新标定光场")
     if model.background_method!=background_method:
         raise ValueError(
             "光场模型的 background_method 与当前配置不一致；请重新标定光场")
     model_sha256=file_sha256(model_path)
-    configured_layout=parse_light_source_layout(
-        lightfield_cfg.get("light_source_layout"))
-    if model.source_layout!=configured_layout:
-        raise ValueError("当前 RGB 灯带布局与光场模型不一致，请先重新标定光场")
-    if background_method in GEOMETRY_BACKGROUND_METHODS \
+    if background_method=="physical_residual":
+        configured_layout=parse_light_source_layout(
+            lightfield_cfg.get("light_source_layout"))
+        if model.source_layout!=configured_layout:
+            raise ValueError(
+                "当前 RGB 灯带布局与光场模型不一致，请先重新标定光场")
+    if background_method in DIRECT_BACKGROUND_METHODS \
             and model.direct_curve_convexity!=reconstruction.curve_convexity:
         raise ValueError(
             "direct 背景模型的曲线凸性语义与法向标定重建不一致；"
@@ -741,11 +813,15 @@ def main() -> None:
         session_sample_shape)
     canonical_mask_sampler=jax.jit(
         lambda source_mask,uv:sample_image_mask_to_canonical_jax(
-            source_mask,uv,session_sample_shape),device=device)
+            source_mask,uv,session_sample_shape))
     offline_b_texture,offline_m_textures=_residual_textures(
         model,device,residual_texture_shape)
     canonical_residual_parts=[]; canonical_valid_parts=[]
     manual_records={}
+    direct_s_hidden=jnp.zeros((
+        model.direct_s_gru_recurrent_weight.shape[0]
+        if background_method=="direct_fit_s"
+        and model.direct_s_gru_recurrent_weight is not None else 0,),jnp.float32)
     manual_regions=load_manual_ellipses(manual_regions_path)
     previous_ellipse: ManualEllipse | None=None
     target_name=("规范曲面残差" if background_method=="physical_residual"
@@ -759,6 +835,7 @@ def main() -> None:
             raise RuntimeError(f"无法读取标定球图像: {image_path}")
         with np.load(observation_path,allow_pickle=False) as data:
             xyz=np.asarray(data["xyz"],np.float32)
+            raw_xyz=np.asarray(data["raw_observed_xyz"],np.float32)
             uv=np.asarray(data["uv"],np.float32)
             st=np.asarray(data["st"],np.float32)
             depth=np.asarray(data["camera_depth"],np.float32)
@@ -766,8 +843,10 @@ def main() -> None:
         device_xyz=jax.device_put(xyz,device)
         device_uv=jax.device_put(uv,device)
         device_results=renderer(
-            device_frame,device_xyz,device_uv,jax.device_put(st,device),
-            jax.device_put(depth,device),offline_b_texture,offline_m_textures)
+            device_frame,device_xyz,jax.device_put(raw_xyz,device),device_uv,
+            jax.device_put(st,device),jax.device_put(depth,device),
+            offline_b_texture,offline_m_textures,direct_s_hidden)
+        direct_s_hidden=device_results[10]
         (cleaned,difference_valid,surface_valid,xyz_image,overflow,
          canonical_residual,canonical_valid)=jax.device_get((
             device_results[0],device_results[1],device_results[2],
@@ -873,6 +952,7 @@ def main() -> None:
         model,device,residual_texture_shape,
         residual_field_coefficients=session_fields)
     color_parts=[]; slope_parts=[]; records=[]
+    direct_s_hidden=jnp.zeros_like(direct_s_hidden)
     for index,(image_path,observation_path) in enumerate(
             zip(paths,observations,strict=True),1):
         frame=cv2.imread(str(image_path),cv2.IMREAD_COLOR)
@@ -880,13 +960,16 @@ def main() -> None:
             raise RuntimeError(f"无法读取标定球图像: {image_path}")
         with np.load(observation_path,allow_pickle=False) as data:
             xyz=np.asarray(data["xyz"],np.float32)
+            raw_xyz=np.asarray(data["raw_observed_xyz"],np.float32)
             uv=np.asarray(data["uv"],np.float32)
             st=np.asarray(data["st"],np.float32)
             depth=np.asarray(data["camera_depth"],np.float32)
         device_results=renderer(
             jax.device_put(frame,device),jax.device_put(xyz,device),
-            jax.device_put(uv,device),jax.device_put(st,device),
-            jax.device_put(depth,device),session_b_texture,session_m_textures)
+            jax.device_put(raw_xyz,device),jax.device_put(uv,device),
+            jax.device_put(st,device),jax.device_put(depth,device),
+            session_b_texture,session_m_textures,direct_s_hidden)
+        direct_s_hidden=device_results[10]
         results=jax.device_get(device_results[:8])
         (cleaned,valid,surface_valid,xyz_image,overflow,gain,bias,
          scores)=results
@@ -947,7 +1030,6 @@ def main() -> None:
         maximum_rms_angle_degrees=float(raw.get("maximum_rms_angle_degrees",5.)))
     residual_basis=(
         "bsession_orthogonal" if background_method=="physical_residual" else
-        "geometry_anchor_cache" if background_method=="geometry_cache" else
         "direct_geometry_conditioned_neural_field")
     saved=calibration.save(
         output,sphere_radius_mm=np.asarray(sphere_radius,np.float32),
@@ -957,6 +1039,7 @@ def main() -> None:
         reconstruction_pipeline=np.asarray(
             SURFACE_RECONSTRUCTION_PIPELINE_VERSION),
         curve_convexity=np.asarray(reconstruction.curve_convexity),
+        material_template_sha256=np.asarray(material_template.sha256),
         accepted_image_count=np.asarray(len(color_parts),np.int32),
         total_image_count=np.asarray(len(paths),np.int32),
         total_sample_count=np.asarray(colors.shape[0],np.int64),

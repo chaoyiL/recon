@@ -2,23 +2,17 @@ import unittest
 import cv2
 import jax.numpy as jnp
 import numpy as np
-import torch
 from render_lightfield import (evaluate_startup_stability,
-                               mask_original_frame, point_set_grid,
-                               torch_tensor_to_jax)
+                               mask_original_frame, point_set_grid)
 from utils.lightfield import (positive_residual_bgr,signed_difference_bgr,
                               signed_residual_bgr,signed_residual_bgr_jax)
-from utils.process import (build_colored_surface_mesh,
+from utils.process import (build_colored_surface_mesh,build_gray_surface_grid,
+                           build_gray_surface_points,
                            build_reconstruction_point_set,
                            SurfaceMeshVisualizer)
 
 
 class RuntimeInMemorySurfaceTest(unittest.TestCase):
-    def test_torch_to_jax_dlpack_preserves_tensor_without_numpy_bridge(self):
-        source=torch.arange(12,dtype=torch.int32).reshape(3,4)
-        shared=torch_tensor_to_jax(source)
-        np.testing.assert_array_equal(np.asarray(shared),np.arange(12).reshape(3,4))
-
     def test_startup_stability_accepts_quiet_window(self):
         offsets=np.asarray([-.008,-.004,0.,.004,.008])
         samples=(np.ones((5,2,3,3),np.float32)*.1
@@ -48,6 +42,20 @@ class RuntimeInMemorySurfaceTest(unittest.TestCase):
         self.assertGreater(result["residual_field_rmse_rgb"][1],.005)
         self.assertGreater(result["gain_range_rgb"][1],.01)
         self.assertGreater(result["bias_range_rgb"][1],.01)
+
+    def test_direct_startup_uses_gain_bias_only_as_diagnostics(self):
+        samples=np.ones((5,2,3,3),np.float32)*.1
+        gains=np.ones((5,3)); gains[:,2]=np.linspace(.95,1.05,5)
+        biases=np.zeros((5,3)); biases[:,2]=np.linspace(-.03,.03,5)
+        result=evaluate_startup_stability(
+            samples,np.ones((5,2,3),bool),gains,biases,
+            residual_field_rmse_threshold=.005,
+            gain_range_threshold=.01,bias_range_threshold=.01,
+            minimum_valid_overlap=.9,require_gain_bias_stability=False)
+        self.assertTrue(result["stable"])
+        self.assertFalse(result["gain_stable"])
+        self.assertFalse(result["bias_stable"])
+        self.assertFalse(result["gain_bias_required"])
 
     def test_original_frame_only_keeps_mask_union(self):
         frame=np.arange(4*5*3,dtype=np.uint8).reshape(4,5,3)
@@ -105,9 +113,34 @@ class RuntimeInMemorySurfaceTest(unittest.TestCase):
         np.testing.assert_allclose(colors[:3],expected,atol=0)
         self.assertGreater(np.ptp(colors[:3]),.8)
 
+    def test_gray_point_cloud_keeps_only_valid_vertices(self):
+        grid=np.arange(3*4*3,dtype=np.float64).reshape(3,4,3)
+        valid=np.ones((3,4),bool); valid[1,2]=False
+        points,colors=build_gray_surface_points(
+            grid,valid_mask=valid,gray_color=(.3,.4,.5))
+        self.assertEqual(points.shape,(11,3))
+        np.testing.assert_array_equal(points,grid[valid])
+        np.testing.assert_allclose(colors,np.asarray([[.3,.4,.5]]*11))
+
+    def test_gray_grid_has_row_and_column_edges_without_diagonals(self):
+        grid=np.arange(3*4*3,dtype=np.float64).reshape(3,4,3)
+        valid=np.ones((3,4),bool); valid[1,1]=False
+        vertices,lines,colors=build_gray_surface_grid(
+            grid,valid_mask=valid,gray_color=(.25,.25,.25))
+        self.assertEqual(vertices.shape,(12,3))
+        self.assertEqual(lines.shape,(13,2))
+        differences=np.abs(lines[:,1]-lines[:,0])
+        self.assertTrue(np.all((differences==1)|(differences==4)))
+        self.assertFalse(np.any(lines==5))
+        np.testing.assert_allclose(colors,.25)
+
     def test_surface_visualizer_rejects_invalid_display_parameters(self):
         with self.assertRaisesRegex(ValueError,"show_coordinate_frame"):
             SurfaceMeshVisualizer(show_coordinate_frame=1)
+        with self.assertRaisesRegex(ValueError,"render_style"):
+            SurfaceMeshVisualizer(render_style="wireframe")
+        with self.assertRaisesRegex(ValueError,"projection"):
+            SurfaceMeshVisualizer(projection="parallel")
 
     def test_signed_difference_uses_gray_for_zero_and_black_outside(self):
         original=np.full((2,2,3),128,np.uint8)

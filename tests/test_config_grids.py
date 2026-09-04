@@ -2,15 +2,41 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from utils.config import (ConfigError,parse_background_method,
-                          parse_direct_fit_config,
-                          parse_geometry_cache_config,
+from utils.config import (ConfigError,load_config,parse_background_method,
+                          parse_direct_fit_3_config,
+                          parse_direct_fit_s_config,
                           parse_reconstruction_config,
                           resolve_background_model_path,resolve_method_path)
 
 
 class ReconstructionGridConfigTest(unittest.TestCase):
-    def test_background_method_selects_separate_model_and_lut_paths(self):
+    def test_config_extends_recursively_merges_nested_mappings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"base.yaml").write_text(
+                "top:\n  keep: 1\n  replace: base\n",encoding="utf-8")
+            (root/"child.yaml").write_text(
+                "extends: base.yaml\ntop:\n  replace: child\nadded: true\n",
+                encoding="utf-8")
+            loaded=load_config(root/"child.yaml")
+        self.assertEqual(loaded,{"top":{"keep":1,"replace":"child"},
+                                 "added":True})
+
+    def test_repository_configs_isolate_physical_residual_settings(self):
+        root=Path(__file__).resolve().parents[1]
+        direct=load_config(root/"config.yaml")
+        physical=load_config(root/"config_physical_residual.yaml")
+        self.assertEqual(parse_background_method(direct["lightfield"]),
+                         "direct_fit_s")
+        self.assertEqual(parse_background_method(physical["lightfield"]),
+                         "physical_residual")
+        self.assertNotIn("light_source_layout",direct["lightfield"])
+        self.assertNotIn("integration_nodes",direct["lightfield"])
+        self.assertIn("light_source_layout",physical["lightfield"])
+        self.assertIn("integration_nodes",physical["lightfield"])
+        self.assertNotIn("delta_initial_mm",direct["lightfield"]["calibration"])
+
+    def test_removed_direct_fit_method_and_paths_are_rejected(self):
         lightfield={
             "background":{
                 "method":"direct_fit",
@@ -25,37 +51,33 @@ class ReconstructionGridConfigTest(unittest.TestCase):
             "direct_fit":"lut/direct.npz",
         }}
         base=Path("/tmp/config-base")
-        method=parse_background_method(lightfield)
-        self.assertEqual(method,"direct_fit")
-        self.assertEqual(
-            resolve_background_model_path(lightfield,method=method,base=base),
-            base/"models/direct.yaml")
-        self.assertEqual(resolve_method_path(
-            local,method=method,mapping_key="calibration_files",
-            legacy_key="calibration_file",base=base,
-            section_name="local_reconstruction"),base/"lut/direct.npz")
+        with self.assertRaises(ConfigError):
+            parse_background_method(lightfield)
+        with self.assertRaises(ConfigError):
+            resolve_method_path(
+                local,method="direct_fit",mapping_key="calibration_files",
+                legacy_key="calibration_file",base=base,
+                section_name="local_reconstruction")
 
-    def test_direct_fit_3_selects_own_paths_and_can_reuse_direct_settings(self):
+    def test_direct_fit_3_selects_own_paths_and_settings(self):
         lightfield={
             "background":{
                 "method":"direct_fit_3",
                 "model_files":{
                     "physical_residual":"models/physical.yaml",
-                    "direct_fit":"models/direct.yaml",
                     "direct_fit_3":"models/direct_3.yaml",
                 },
             },
-            "direct_fit":{"neural_field":{"decoder_width":77}},
+            "direct_fit_3":{"neural_field":{"decoder_width":77}},
         }
         local={"calibration_files":{
             "physical_residual":"lut/physical.npz",
-            "direct_fit":"lut/direct.npz",
             "direct_fit_3":"lut/direct_3.npz",
         }}
         base=Path("/tmp/config-base")
         method=parse_background_method(lightfield)
         self.assertEqual(method,"direct_fit_3")
-        self.assertEqual(parse_direct_fit_config(lightfield).decoder_width,77)
+        self.assertEqual(parse_direct_fit_3_config(lightfield).decoder_width,77)
         self.assertEqual(
             resolve_background_model_path(lightfield,method=method,base=base),
             base/"models/direct_3.yaml")
@@ -64,33 +86,10 @@ class ReconstructionGridConfigTest(unittest.TestCase):
             legacy_key="calibration_file",base=base,
             section_name="local_reconstruction"),base/"lut/direct_3.npz")
 
-    def test_geometry_cache_selects_independent_paths_and_parameters(self):
-        lightfield={
-            "background":{"method":"geometry_cache","model_files":{
-                "geometry_cache":"models/cache.yaml"}},
-            "geometry_cache":{
-                "descriptor":{"curve_coefficients":10,"pca_dimensions":6,
-                              "huber_delta_mm":.3},
-                "anchors":{"count":12,"neighbor_count":5,
-                           "interpolation_neighbor_count":3,
-                           "interpolation_distance_power":1.5,
-                           "interpolation_distance_epsilon":.002,
-                           "background_huber_delta":.03,
-                           "background_huber_iterations":4,
-                           "fit_batch_size":3},
-                "sample_filter":{"saturation_threshold":254,
-                                 "erode_pixels":2},
-                "session_correction_max_deviation":.2}}
-        parsed=parse_geometry_cache_config(lightfield)
-        self.assertEqual(parse_background_method(lightfield),"geometry_cache")
-        self.assertEqual(parsed.anchor_count,12)
-        self.assertEqual(parsed.anchor_neighbor_count,5)
-        self.assertEqual(parsed.interpolation_neighbor_count,3)
-        self.assertEqual(parsed.descriptor_curve_coefficients,10)
-        self.assertAlmostEqual(parsed.session_correction_max_deviation,.2)
-        self.assertEqual(resolve_background_model_path(
-            lightfield,method="geometry_cache",base="/tmp"),
-            Path("/tmp/models/cache.yaml"))
+    def test_removed_geometry_cache_method_is_rejected(self):
+        lightfield={"background":{"method":"geometry_cache"}}
+        with self.assertRaises(ConfigError):
+            parse_background_method(lightfield)
 
     def test_legacy_background_config_defaults_to_physical_method(self):
         lightfield={"model_file":"models/legacy.yaml"}
@@ -101,7 +100,7 @@ class ReconstructionGridConfigTest(unittest.TestCase):
             Path("/tmp/models/legacy.yaml"))
 
     def test_direct_fit_network_and_geometry_config_are_validated(self):
-        parsed=parse_direct_fit_config({})
+        parsed=parse_direct_fit_3_config({})
         self.assertEqual(parsed.coordinate_frequencies,(1.,2.,4.,8.,16.,32.))
         self.assertEqual(parsed.geometry_latent_dimensions,96)
         self.assertEqual(parsed.geometry_pca_dimensions,32)
@@ -109,11 +108,8 @@ class ReconstructionGridConfigTest(unittest.TestCase):
         self.assertEqual(parsed.base_huber_iterations,5)
         self.assertEqual(parsed.adaptive_channel_weight_strength,0.)
         self.assertEqual(parsed.spatial_difference_weight,1.)
-        self.assertEqual(parsed.spatial_difference_validation_weight,1.)
         self.assertEqual(parsed.spatial_difference_points_per_frame,1024)
         self.assertAlmostEqual(parsed.geometry_difference_weight,.25)
-        self.assertAlmostEqual(
-            parsed.geometry_difference_validation_weight,.25)
         self.assertEqual(parsed.geometry_difference_neighbor_count,16)
         self.assertEqual(parsed.geometry_difference_points_per_pair,512)
         self.assertEqual(parsed.validation_interval,100)
@@ -122,10 +118,9 @@ class ReconstructionGridConfigTest(unittest.TestCase):
         self.assertEqual(parsed.early_stopping_patience,10)
         self.assertEqual(parsed.early_stopping_min_steps,1500)
         self.assertAlmostEqual(parsed.early_stopping_min_delta,5e-5)
-        self.assertEqual(parsed.sample_saturation_threshold,255)
         self.assertEqual(parsed.sample_erode_pixels,2)
         self.assertAlmostEqual(parsed.session_correction_max_deviation,.15)
-        configured=parse_direct_fit_config({"direct_fit":{
+        configured=parse_direct_fit_3_config({"direct_fit_3":{
             "neural_field":{
                 "frequencies":[1,3],"geometry_descriptor_rows":12,
                 "geometry_encoder_width":48,"geometry_latent_dimensions":7,
@@ -134,17 +129,15 @@ class ReconstructionGridConfigTest(unittest.TestCase):
                 "base_huber_iterations":3,
                 "adaptive_channel_weight_strength":.6,
                 "spatial_difference_weight":.6,
-                "spatial_difference_validation_weight":.8,
                 "spatial_difference_points_per_frame":144,
                 "geometry_difference_weight":.4,
-                "geometry_difference_validation_weight":.7,
                 "geometry_difference_neighbor_count":6,
                 "geometry_difference_points_per_pair":96,
                 "validation_interval":20,"validation_frame_count":9,
                 "validation_points_per_frame":128,
                 "early_stopping_patience":4,"early_stopping_min_steps":800,
                 "early_stopping_min_delta":.0002},
-            "sample_filter":{"saturation_threshold":253,"erode_pixels":1},
+            "sample_filter":{"erode_pixels":1},
             "session_correction_max_deviation":.08,
         }})
         self.assertEqual(configured.coordinate_frequencies,(1.,3.))
@@ -156,36 +149,50 @@ class ReconstructionGridConfigTest(unittest.TestCase):
         self.assertEqual(configured.base_huber_iterations,3)
         self.assertAlmostEqual(configured.adaptive_channel_weight_strength,.6)
         self.assertAlmostEqual(configured.spatial_difference_weight,.6)
-        self.assertAlmostEqual(
-            configured.spatial_difference_validation_weight,.8)
         self.assertEqual(configured.spatial_difference_points_per_frame,144)
         self.assertAlmostEqual(configured.geometry_difference_weight,.4)
-        self.assertAlmostEqual(
-            configured.geometry_difference_validation_weight,.7)
         self.assertEqual(configured.geometry_difference_neighbor_count,6)
         self.assertEqual(configured.validation_interval,20)
         self.assertEqual(configured.validation_frame_count,9)
         self.assertEqual(configured.early_stopping_patience,4)
         self.assertEqual(configured.early_stopping_min_steps,800)
-        self.assertEqual(configured.sample_saturation_threshold,253)
         self.assertEqual(configured.sample_erode_pixels,1)
         with self.assertRaisesRegex(ConfigError,"frequencies"):
-            parse_direct_fit_config({"direct_fit":{
+            parse_direct_fit_3_config({"direct_fit_3":{
                 "neural_field":{"frequencies":[1,0]}}})
         with self.assertRaisesRegex(ConfigError,"未知字段"):
-            parse_direct_fit_config({"direct_fit":{"b_coefficient_bounds":[0,1]}})
+            parse_direct_fit_3_config({"direct_fit_3":{"b_coefficient_bounds":[0,1]}})
         with self.assertRaisesRegex(ConfigError,"未知字段"):
-            parse_direct_fit_config({"direct_fit":{
+            parse_direct_fit_3_config({"direct_fit_3":{
                 "neural_field":{"smooth_lambda":0}}})
-        with self.assertRaisesRegex(ConfigError,"不大于 255"):
-            parse_direct_fit_config({"direct_fit":{
+        with self.assertRaisesRegex(ConfigError,"未知字段"):
+            parse_direct_fit_3_config({"direct_fit_3":{
                 "sample_filter":{"saturation_threshold":256}}})
         with self.assertRaisesRegex(ConfigError,"不能大于 steps"):
-            parse_direct_fit_config({"direct_fit":{"neural_field":{
+            parse_direct_fit_3_config({"direct_fit_3":{"neural_field":{
                 "steps":10,"early_stopping_min_steps":11}}})
         with self.assertRaisesRegex(ConfigError,"不大于 1"):
-            parse_direct_fit_config({"direct_fit":{"neural_field":{
+            parse_direct_fit_3_config({"direct_fit_3":{"neural_field":{
                 "adaptive_channel_weight_strength":1.1}}})
+
+    def test_direct_fit_s_sequence_and_runtime_config_are_validated(self):
+        parsed=parse_direct_fit_s_config({"direct_fit_s":{
+            "neural_field":{"gru_hidden_dimensions":17},
+            "training":{"clip_length":8,"clip_batch_size":2},
+            "sequence":{"cycles_per_video":2,"cycle_sample_frames":10,
+                        "cycle_endpoint_frames":2},
+            "runtime":{"online_gain_bias_enabled":False}}})
+        self.assertEqual(parsed.gru_hidden_dimensions,17)
+        self.assertEqual(parsed.clip_length,8)
+        self.assertEqual(parsed.cycles_per_video,2)
+        self.assertFalse(parsed.online_gain_bias_enabled)
+        with self.assertRaisesRegex(ConfigError,"online_gain_bias_enabled"):
+            parse_direct_fit_s_config({"direct_fit_s":{
+                "runtime":{"online_gain_bias_enabled":1}}})
+        with self.assertRaisesRegex(ConfigError,"两端总数"):
+            parse_direct_fit_s_config({"direct_fit_s":{
+                "sequence":{"cycle_sample_frames":4,
+                            "cycle_endpoint_frames":3}}})
 
     def calibration(self,directory: str) -> Path:
         path=Path(directory)/"camera.yaml"
@@ -217,6 +224,70 @@ class ReconstructionGridConfigTest(unittest.TestCase):
             (result.residual_texture_rows,result.residual_texture_columns),
             (256,128))
         self.assertEqual(result.curve_convexity,"increasing")
+        self.assertAlmostEqual(result.side_edge_exclusion_ratio,.02)
+        self.assertAlmostEqual(result.material_surface.width_mm,22.)
+        self.assertAlmostEqual(result.material_surface.length_mm,55.)
+        self.assertEqual(result.material_surface.s_zero_endpoint,"image_top")
+        self.assertAlmostEqual(result.s1,11.)
+        self.assertAlmostEqual(result.s2,-11.)
+        self.assertAlmostEqual(
+            result.material_surface.calibration_maximum_rms_px,4.)
+        self.assertAlmostEqual(
+            result.material_surface.calibration_minimum_confidence,.05)
+
+    def test_material_dimensions_and_s_zero_endpoint_are_configurable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calibration=self.calibration(directory)
+            configured=parse_reconstruction_config({
+                "calibration_file":str(calibration),
+                "material_surface":{
+                    "width_mm":24.,
+                    "length_mm":60.,
+                    "s_zero_endpoint":"image_bottom",
+                    "calibration_maximum_rms_px":3.5,
+                    "calibration_minimum_confidence":.1,
+                },
+            },config_path=Path(directory)/"config.yaml")
+        self.assertAlmostEqual(configured.material_surface.width_mm,24.)
+        self.assertAlmostEqual(configured.material_surface.length_mm,60.)
+        self.assertEqual(
+            configured.material_surface.s_zero_endpoint,"image_bottom")
+        self.assertAlmostEqual(configured.s1,12.)
+        self.assertAlmostEqual(configured.s2,-12.)
+        self.assertAlmostEqual(configured.material_template.st[0,0,0],1.)
+        self.assertAlmostEqual(configured.material_template.st[-1,0,0],0.)
+        self.assertAlmostEqual(
+            configured.material_surface.calibration_maximum_rms_px,3.5)
+        self.assertAlmostEqual(
+            configured.material_surface.calibration_minimum_confidence,.1)
+
+    def test_material_dimensions_and_s_zero_endpoint_are_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calibration=self.calibration(directory)
+            for values,pattern in (
+                ({"width_mm":0.},"width_mm"),
+                ({"length_mm":-1.},"length_mm"),
+                ({"s_zero_endpoint":"left"},"s_zero_endpoint"),
+            ):
+                with self.assertRaisesRegex(ConfigError,pattern):
+                    parse_reconstruction_config({
+                        "calibration_file":str(calibration),
+                        "material_surface":values,
+                    },config_path=Path(directory)/"config.yaml")
+
+    def test_material_update_failure_thresholds_are_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calibration=self.calibration(directory)
+            for values,pattern in (
+                ({"calibration_maximum_rms_px":0.},"正数"),
+                ({"calibration_minimum_confidence":1e-7},"confidence_floor"),
+                ({"calibration_minimum_confidence":1.},"confidence_floor"),
+            ):
+                with self.assertRaisesRegex(ConfigError,pattern):
+                    parse_reconstruction_config({
+                        "calibration_file":str(calibration),
+                        "material_surface":values,
+                    },config_path=Path(directory)/"config.yaml")
 
     def test_legacy_grid_fields_remain_compatible(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +335,21 @@ class ReconstructionGridConfigTest(unittest.TestCase):
                     "curve_convexity":"sometimes",
                 },config_path=Path(directory)/"config.yaml")
 
+    def test_side_edge_exclusion_ratio_is_configurable_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calibration=self.calibration(directory)
+            configured=parse_reconstruction_config({
+                "calibration_file":str(calibration),
+                "side_edge_exclusion_ratio":.075,
+            },config_path=Path(directory)/"config.yaml")
+            self.assertAlmostEqual(configured.side_edge_exclusion_ratio,.075)
+            for invalid in (-.01,.5,True):
+                with self.assertRaisesRegex(ConfigError,"位于"):
+                    parse_reconstruction_config({
+                        "calibration_file":str(calibration),
+                        "side_edge_exclusion_ratio":invalid,
+                    },config_path=Path(directory)/"config.yaml")
+
     def test_removed_temporal_prior_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             calibration=self.calibration(directory)
@@ -272,6 +358,29 @@ class ReconstructionGridConfigTest(unittest.TestCase):
                     "calibration_file":str(calibration),
                     "temporal_prior":{"enabled":True},
                 },config_path=Path(directory)/"config.yaml")
+
+    def test_removed_length_based_full_observation_switch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calibration=self.calibration(directory)
+            with self.assertRaisesRegex(
+                    ConfigError,"未知字段.*full_observation"):
+                parse_reconstruction_config({
+                    "calibration_file":str(calibration),
+                    "material_surface":{
+                        "full_observation_length_tolerance_ratio":.03},
+                },config_path=Path(directory)/"config.yaml")
+
+    def test_removed_endpoint_matching_options_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calibration=self.calibration(directory)
+            for name,value in (
+                    ("startup_length_tolerance_ratio",.05),
+                    ("temporal_blend",.2)):
+                with self.assertRaisesRegex(ConfigError,f"未知字段.*{name}"):
+                    parse_reconstruction_config({
+                        "calibration_file":str(calibration),
+                        "material_surface":{name:value},
+                    },config_path=Path(directory)/"config.yaml")
 
 
 if __name__=="__main__":
