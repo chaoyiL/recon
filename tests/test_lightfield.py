@@ -18,6 +18,7 @@ from utils.lightfield import (LightFieldModel, bounded_mixing_matrix,
                               direct_background_field_chunked,
                               direct_background_field_jax,
                               direct_s_background_field_jax,
+                              direct_s_interval_from_logits_jax,
                               direct_s_recurrent_step_jax,
                               direct_geometry_descriptor_jax,
                               direct_local_geometry_feature_grid_jax,
@@ -115,8 +116,8 @@ def make_direct_s_model() -> LightFieldModel:
     descriptor_rows=4
     descriptor_count=6+10*descriptor_rows
     frequencies=np.asarray([1.],np.float32)
-    latent=3; pca=2; hidden=4
-    color_input=2+4*frequencies.size+latent+pca+10+hidden
+    latent=3; pca=2; hidden=4; appearance=2
+    color_input=2+4*frequencies.size+latent+pca+10+hidden+appearance
     return LightFieldModel.direct_fit_s(
         np.zeros((3,4,4),np.float32),
         base_texture=np.full((7,5,3),.5,np.float32),
@@ -130,14 +131,31 @@ def make_direct_s_model() -> LightFieldModel:
         geometry_encoder_weights=(
             np.zeros((descriptor_count,latent),np.float32),),
         geometry_encoder_biases=(np.zeros(latent,np.float32),),
-        gru_input_weight=np.zeros((latent,3*hidden),np.float32),
+        gru_input_weight=np.zeros((latent+1,3*hidden),np.float32),
         gru_recurrent_weight=np.zeros((hidden,3*hidden),np.float32),
         gru_bias=np.zeros(3*hidden,np.float32),
-        warp_weight=np.zeros((hidden,3),np.float32),
-        warp_bias=np.asarray([-7.,0.,-7.],np.float32),
+        warp_weight=np.zeros((hidden,2),np.float32),
+        warp_bias=np.zeros(2,np.float32),
+        length_reference_mm=5.,
+        full_visibility_threshold=.97,
+        minimum_visible_fraction=.35,
+        measurement_prior_logit_limit=4.,
         color_trunk_weights=(
             np.zeros((color_input,6),np.float32),),
         color_trunk_biases=(np.zeros(6,np.float32),),
+        appearance_mean=np.zeros((3,2,3),np.float32),
+        appearance_components=np.zeros((2,3,2,3),np.float32),
+        appearance_score_mean=np.zeros(2,np.float32),
+        appearance_score_scale=np.ones(2,np.float32),
+        appearance_score_clip=3.,
+        appearance_weight=np.zeros((hidden,2),np.float32),
+        appearance_bias=np.zeros(2,np.float32),
+        appearance_memory_hidden_mean=np.zeros(hidden,np.float32),
+        appearance_memory_hidden_scale=np.ones(hidden,np.float32),
+        appearance_memory_anchors=np.zeros((3,hidden),np.float32),
+        appearance_memory_residuals=np.zeros((3,2),np.float32),
+        appearance_memory_neighbors=2,
+        appearance_memory_epsilon=1e-6,
         channel_head_weights=tuple(
             (np.zeros((6+color_input,1),np.float32),) for _ in range(3)),
         channel_head_biases=tuple(
@@ -426,18 +444,66 @@ class LightFieldTest(unittest.TestCase):
             model.save(path)
             raw=yaml.safe_load(path.read_text(encoding="utf-8"))
             loaded=LightFieldModel.load(path)
-        self.assertEqual(raw["format_version"],26)
+        self.assertEqual(raw["format_version"],33)
+        self.assertEqual(
+            raw["direct_color_conditioning_mode"],
+            "geometry_gru_explicit_appearance_state")
         self.assertEqual(raw["direct_warp_mode"],
-                         "affine_s_softmax_interval")
+                         "affine_s_measured_prior_learned_interval")
+        self.assertTrue(raw["direct_s_use_appearance_memory"])
+        self.assertTrue(raw["direct_s_use_recurrent_history"])
+        self.assertTrue(raw["direct_s_use_local_geometry"])
+        self.assertTrue(loaded.direct_s_use_appearance_memory)
+        self.assertTrue(loaded.direct_s_use_recurrent_history)
+        self.assertTrue(loaded.direct_s_use_local_geometry)
         y,x=np.meshgrid(np.arange(6.),np.arange(3.),indexing="ij")
         xyz=np.stack([x,y,np.ones_like(x)*100],axis=-1).astype(np.float32)
         hidden,interval,_,_=direct_s_recurrent_step_jax(
             xyz,jnp.zeros((4,),jnp.float32),loaded)
         self.assertAlmostEqual(float(np.asarray(interval).sum()),1.,places=6)
-        self.assertGreater(float(interval[1]),.99)
+        self.assertGreater(float(interval[1]),.98)
         field=np.asarray(direct_s_background_field_jax(
             (7,5),xyz,xyz,hidden,interval,loaded))
         np.testing.assert_allclose(field,.5,atol=1e-6)
+
+        shortened=xyz.copy()
+        shortened[...,1]*=.5
+        _,short_interval,_,_=direct_s_recurrent_step_jax(
+            shortened,jnp.zeros((4,),jnp.float32),loaded)
+        np.testing.assert_allclose(
+            np.asarray(short_interval),[.25,.5,.25],atol=1e-6)
+
+    def test_direct_fit_s_can_correct_a_full_length_measurement_prior(self):
+        interval=np.asarray(direct_s_interval_from_logits_jax(
+            jnp.asarray(1.,jnp.float32),jnp.asarray([0.,-9.],jnp.float32),
+            jnp.asarray(.35,jnp.float32),jnp.asarray(4.,jnp.float32)))
+        self.assertLess(float(interval[1]),.9)
+        np.testing.assert_allclose(interval.sum(),1.,atol=1e-6)
+        np.testing.assert_allclose(interval[0],interval[2],atol=1e-6)
+
+    def test_old_hard_measured_direct_fit_s_model_is_rejected(self):
+        model=make_direct_s_model()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"direct_s_old.yaml"
+            model.save(path)
+            raw=yaml.safe_load(path.read_text(encoding="utf-8"))
+            raw["format_version"]=27
+            raw["direct_warp_mode"]="affine_s_measured_length_side_split"
+            path.write_text(yaml.safe_dump(raw),encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,"版本已经过期"):
+                LightFieldModel.load(path)
+
+    def test_direct_fit_s_model_without_color_supervised_gru_is_rejected(self):
+        model=make_direct_s_model()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"direct_s_old_color_training.yaml"
+            model.save(path)
+            raw=yaml.safe_load(path.read_text(encoding="utf-8"))
+            raw["format_version"]=28
+            raw.pop("direct_color_conditioning_mode")
+            path.write_text(yaml.safe_dump(raw),encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,"版本已经过期"):
+                LightFieldModel.load(path)
 
     def test_direct_neural_field_changes_with_global_geometry(self):
         descriptor_rows=4; descriptor_count=6+10*descriptor_rows

@@ -1,0 +1,8 @@
+extends: ../../config.yaml
+
+lightfield:
+  model_file: ~/recon/assets/ablations/lightfield_direct_fit_s_no_local_geometry.yaml
+  direct_fit_s:
+    ablation:
+      use_local_geometry: false
+

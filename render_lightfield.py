@@ -37,7 +37,8 @@ from utils.jax_reconstruction import (
 from utils.lightfield import (LightFieldModel, choose_device, irls_gain_bias,
     bgr_to_linear_rgb_jax, build_canonical_residual_sample_jax, erode_mask_jax,
     direct_background_field_jax,direct_s_background_field_jax,
-    direct_s_recurrent_step_jax,evaluate_rgb_bspline,
+    direct_s_interval_from_logits_jax,direct_s_recurrent_step_jax,
+    direct_s_visible_fraction_jax,evaluate_rgb_bspline,
     fit_uniform_huber_residual_correction_scores_jax,
     fit_uniform_residual_correction_scores_jax,
     fit_startup_direct_bsession_model,fit_startup_residual_bsession_model,
@@ -554,9 +555,6 @@ def main() -> None:
         parse_direct_fit_3_config(cfg) if background_method=="direct_fit_3"
         else parse_direct_fit_s_config(cfg)
         if background_method=="direct_fit_s" else None)
-    direct_s_online_gain_bias=(
-        direct_session_config.online_gain_bias_enabled
-        if background_method=="direct_fit_s" else True)
     if background_method in DIRECT_BACKGROUND_METHODS:
         # direct 模型离线训练与实时 Bsession 使用同一几何边界腐蚀。
         startup_erode_pixels=direct_session_config.sample_erode_pixels
@@ -677,9 +675,19 @@ def main() -> None:
             def retain(_):
                 weight=model.direct_s_warp_weight
                 bias=model.direct_s_warp_bias
-                assert weight is not None and bias is not None
+                reference=model.direct_s_length_reference_mm
+                threshold=model.direct_s_full_visibility_threshold
+                minimum=model.direct_s_minimum_visible_fraction
+                prior_limit=model.direct_s_measurement_prior_logit_limit
+                assert weight is not None and bias is not None \
+                    and reference is not None and threshold is not None \
+                    and minimum is not None and prior_limit is not None
+                measured=direct_s_visible_fraction_jax(
+                    direct_s_raw_xyz,reference,threshold,minimum)
                 return (previous_direct_s_hidden,
-                        jax.nn.softmax(previous_direct_s_hidden@weight+bias))
+                        direct_s_interval_from_logits_jax(
+                            measured,previous_direct_s_hidden@weight+bias,
+                            minimum,prior_limit))
             direct_s_hidden,direct_s_interval=jax.lax.cond(
                 material_tracking_accepted,advance,retain,operand=None)
             direct_base_texture=direct_s_background_field_jax(
@@ -771,11 +779,8 @@ def main() -> None:
         else:
             valid=coordinate_valid
             raster_overflow=coordinate_overflow
-            # 几何背景负责空间/弯曲结构；当前帧仍需鲁棒估计全局通道
-            # gain/bias 开关由具体 direct 模式配置；direct_fit_s 默认固定为
-            # gain=1、bias=0，完全不读取当前图像来修正神经背景。
-            if background_method=="direct_fit_s" \
-                    and not direct_s_online_gain_bias:
+            # direct_fit_s 固定 gain=1、bias=0，不读取当前图像修正背景。
+            if background_method=="direct_fit_s":
                 gain=jnp.ones((3,),jnp.float32)
                 bias=jnp.zeros((3,),jnp.float32)
                 weights=valid.astype(jnp.float32)
@@ -1069,11 +1074,9 @@ def main() -> None:
                 f"{startup_gain_bias_frame_count} 帧确定 gain/bias 先验，并采集 "
                 f"{startup_frame_count} 帧拟合 Bsession 并重参数化 raw M。")
         else:
-            gain_text=(
-                "；逐帧 gain/bias 已禁用。"
-                if background_method=="direct_fit_s"
-                and not direct_s_online_gain_bias
-                else "；逐帧鲁棒拟合 RGB gain/bias。")
+            gain_text=("；逐帧 gain/bias 已禁用。"
+                       if background_method=="direct_fit_s"
+                       else "；逐帧鲁棒拟合 RGB gain/bias。")
             print(
                 f"{background_method} 启动将在连续 "
                 f"{startup_stability_frames} 帧稳定后，"

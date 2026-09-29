@@ -7,12 +7,17 @@ from unittest.mock import MagicMock, patch
 import cv2
 import jax
 import numpy as np
+import yaml
 from calibrate_lightfield import (_iter_physical_batch_indices,
+                                  _cached_material_sequence_identity,
                                   _cached_reconstruction_failure,
                                   _cached_observation_pose,
+                                  _failure_diagnostic_paths,
+                                  _material_sequence_identity,
                                   _reconstruction_failure_path,
                                   _refine_calibration_masks,
                                   _write_reconstruction_failure,
+                                  _write_failure_diagnostic_from_record,
                                   _write_material_initialization_failure,
                                   _observation_metadata,
                                   _split_calibration_indices,
@@ -25,6 +30,65 @@ from utils.process import build_reconstruction_point_set
 from utils.surface_mask import MaskRefineConfig,refine_mask
 
 class LightFieldCalibrationSampleTest(unittest.TestCase):
+    def test_material_sequence_identity_accepts_all_video_frame_prefixes(self):
+        cases={
+            "video_001_input_frame_00000008.png":
+                ("video_001_input",8),
+            "trusted_flat_video_001_trusted_flat_frame_00000126.png":
+                ("trusted_flat_video_001_trusted_flat",126),
+            "bend_sequence_video_002_flat_bend_flat_frame_00000488.png":
+                ("bend_sequence_video_002_flat_bend_flat",488),
+            "validation_sequence_video_001_val_frame_00000540.png":
+                ("validation_sequence_video_001_val",540),
+        }
+        for name,expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(_material_sequence_identity(Path(name)),expected)
+        self.assertEqual(
+            _material_sequence_identity(Path("independent_frame_00000008.png")),
+            (None,None))
+
+    def test_cached_sequence_identity_recovers_buggy_direct_fit_s_cache(self):
+        source=Path(
+            "bend_sequence_video_001_flat_bend_flat_frame_00000488.png")
+        self.assertEqual(
+            _cached_material_sequence_identity(source,"",-1),
+            ("bend_sequence_video_001_flat_bend_flat",488))
+        self.assertEqual(
+            _cached_material_sequence_identity(source,"stored_sequence",17),
+            ("stored_sequence",17))
+
+    def test_video_cache_with_missing_sequence_metadata_is_invalidated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            image=root/(
+                "bend_sequence_video_001_cycle_frame_00000006.png")
+            cv2.imwrite(str(image),np.zeros((32,40,3),np.uint8))
+            point_set,_,_=build_reconstruction_point_set(
+                np.asarray([[-1.,0.,100.],[-1.,1.,100.]]),
+                np.asarray([[1.,0.,100.],[1.,1.,100.]]),
+                np.asarray([[20.,0.,20.],[0.,20.,16.],[0.,0.,1.]]),
+                np.zeros(5),np.zeros(3),0.,n_fill=1)
+            metadata=_observation_metadata(
+                image,"signature","increasing",np.zeros(3),0.,
+                np.asarray([.5]),raw_observed_xyz=np.asarray(
+                    point_set.xyz,np.float32).reshape(2,3,3))
+            observation=save_calibration_observation(
+                image,np.zeros((32,40,3),np.uint8),point_set,
+                root/"samples",root/"maps",
+                reconstruction_metadata=metadata)
+            self.assertIsNone(_cached_observation_pose(
+                observation,image,"signature","increasing",(2,3),250,False))
+            failure=_reconstruction_failure_path(root/"samples",image)
+            _write_reconstruction_failure(
+                failure,image,"signature","increasing",
+                stage="material_calibration_admission",
+                failure_reasons=("rms_too_high",),
+                saturation_threshold=250,
+                filter_original_saturation=False)
+            self.assertIsNone(_cached_reconstruction_failure(
+                failure,image,"signature","increasing",250,False))
+
     def test_calibration_mask_refine_exactly_matches_sam_preview(self):
         raw=np.zeros((1,100,120),np.uint8)
         cv2.fillPoly(
@@ -276,6 +340,15 @@ class LightFieldCalibrationSampleTest(unittest.TestCase):
                     material_update_failure_diagnostic_dir=
                         update_diagnostic_dir,
                     independent_material_sequence_id="normal_images")
+                stale_success_record=_reconstruction_failure_path(
+                    root/"samples",images[0])
+                stale_success_record.write_bytes(b"stale")
+                stale_overview_dir=root/"samples"/"failures"
+                stale_overview_dir.mkdir(parents=True,exist_ok=True)
+                stale_success_overview,stale_success_yaml=(
+                    _failure_diagnostic_paths(stale_overview_dir,images[0]))
+                stale_success_overview.write_bytes(b"stale")
+                stale_success_yaml.write_bytes(b"stale")
                 repeated_outputs=reconstruct_all_observations(
                     images,config,root,root/"samples",root/"maps",
                     material_initialization_diagnostic_dir=diagnostic_dir,
@@ -284,6 +357,9 @@ class LightFieldCalibrationSampleTest(unittest.TestCase):
                     independent_material_sequence_id="normal_images")
             self.assertEqual(len(outputs),2)
             self.assertEqual(repeated_outputs,outputs)
+            self.assertFalse(stale_success_record.exists())
+            self.assertFalse(stale_success_overview.exists())
+            self.assertFalse(stale_success_yaml.exists())
             self.assertTrue(diagnostic_dir.is_dir())
             self.assertTrue((update_diagnostic_dir/
                              "frame_1_material_update_failure.jpg").is_file())
@@ -401,5 +477,29 @@ class LightFieldCalibrationSampleTest(unittest.TestCase):
             cv2.imwrite(str(image),np.ones((8,10,3),np.uint8))
             self.assertIsNone(_cached_reconstruction_failure(
                 output,image,"signature","increasing",250,False))
+
+    def test_failure_record_generates_viewable_overview_and_yaml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            image=root/"frame.png"
+            cv2.imwrite(str(image),np.full((120,320,3),80,np.uint8))
+            record=_reconstruction_failure_path(root/"samples",image)
+            _write_reconstruction_failure(
+                record,image,"signature","increasing",
+                stage="fixed_pose_initialization",
+                failure_reasons=("fixed_pose_initialization_failed",),
+                saturation_threshold=250,
+                filter_original_saturation=False,
+                sequence_id="video_001_test",sequence_frame_index=8)
+            overview,description=_write_failure_diagnostic_from_record(
+                record,image,root/"failures")
+            self.assertIsNotNone(cv2.imread(str(overview)))
+            self.assertTrue(description.exists())
+            document=yaml.safe_load(description.read_text(encoding="utf-8"))
+            self.assertEqual(document["stage"],"fixed_pose_initialization")
+            self.assertEqual(
+                document["reasons"],["fixed_pose_initialization_failed"])
+            self.assertEqual(document["sequence_id"],"video_001_test")
+            self.assertEqual(document["sequence_frame_index"],8)
 
 if __name__=="__main__": unittest.main()

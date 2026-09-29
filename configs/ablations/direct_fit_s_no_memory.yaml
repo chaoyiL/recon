@@ -1,0 +1,11 @@
+extends: ../../config.yaml
+
+lightfield:
+  model_file: ~/recon/assets/ablations/lightfield_direct_fit_s_no_memory.yaml
+  direct_fit_s:
+    ablation:
+      use_appearance_memory: false
+    # 给参数化 appearance head 远多于完整模型的优化机会；如果仍落后，
+    # 才能把差异归因于 memory，而不是默认 100 步不足。
+    training:
+      appearance_train_steps: 4000

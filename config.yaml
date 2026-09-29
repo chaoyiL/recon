@@ -131,11 +131,15 @@ get_surface:
       s_zero_endpoint: image_top
       initial_calibration_maximum_rms_px: 4.0
       # 初始化后，RMS/confidence 只决定是否写入标定集；不会回滚追踪状态。
-      calibration_maximum_rms_px: 4.0
+      # 弯曲视频的边界局部不符合理想横截面，4 px 硬门会重复淘汰大量结构
+      # 安全帧。放宽硬上限，仍由下方综合 confidence 及 UV 结构检查把关。
+      calibration_maximum_rms_px: 15.0
       calibration_minimum_confidence: 0.05
       # 匹配距离、RMS 和覆盖率共同形成 confidence，仅用于标定准入评分。
       match_confidence_scale_mm: 8.0
-      rms_confidence_scale_px: 4.0
+      # 5.5 px 与 confidence>=0.05 组合后，理想匹配下的有效 RMS 上限约
+      # 13.45 px；匹配距离越大，实际上限会自动收紧。
+      rms_confidence_scale_px: 5.5
       confidence_floor: 1.0e-6
       visibility_depth_tolerance_mm: 1.0
 
@@ -337,55 +341,97 @@ lightfield:
       geometry_encoder_layers: 2
       geometry_latent_dimensions: 64
       geometry_pca_dimensions: 32
-      gru_hidden_dimensions: 64
+      # GRU 保持 128 维；256 维外观系数由状态记忆补足参数回归残差。
+      gru_hidden_dimensions: 128
+      # 在规范光场上提取跨形变外观 PCA，监督 GRU 并形成运行时低秩场；
+      # 实时端不需要当前 RGB。
+      appearance_descriptor_rows: 100
+      appearance_descriptor_columns: 51
+      appearance_pca_dimensions: 256
+      # PCA 只使用弯曲序列中至少 10% 帧都有有效观测的位置，排除从未
+      # 观测的区域，同时尽量覆盖确定性评估中的全部有效像素。
+      # 所有至少在一帧中有效的材料位置都进入带 mask 的外观分解；从未
+      # 观测的位置虽通过阈值，但始终权重为零，不影响损失与预测。
+      appearance_minimum_coverage: 0.001
+      # 在 GRU hidden 空间对标定状态的系数残差做近邻插值；精确命中训练
+      # 轨迹时恢复对应状态，未见状态仍以 GRU 参数化预测为基准。
+      appearance_memory_neighbors: 4
+      appearance_memory_epsilon: 1.0e-6
       # 颜色网络为共享 trunk + 三个独立标量 head；各层保留完整输入跳连。
       color_trunk_width: 224
       color_trunk_layers: 4
       color_head_width: 128
       color_head_layers: 2
+    measurement:
+      # 不使用名义 55 mm 直接归一，而以可信平直视频的原始三维弧长中位数为
+      # 满长基准。该比例只作为 GRU 输入先验，不再硬性决定 warp 长度。
+      # 高于该比例的测长先验记为满长，最终 visible 仍可由 WarpNet 下调。
+      full_visibility_threshold: 0.97
+      # WarpNet 所预测可见比例的安全下限。
+      minimum_visible_fraction: 0.35
+      # 限制测长先验的 logit 置信度，避免 prior=1 时修正梯度消失。
+      prior_logit_limit: 4.0
     training:
-      # 阶段 1 的静态 B 无梯度训练，由可信平直视频做逐像素 Huber 聚合。
-      # 阶段 2 固定 identity warp 预训练颜色；阶段 3 冻结颜色 trunk/head
-      # 训练 GRU+warp；阶段 4 低学习率联合微调。
-      color_pretrain_steps: 2500
-      warp_train_steps: 2500
-      joint_finetune_steps: 2500
-      # 训练只按同一视频的时间顺序抽片段；是否跨过失败/缺失帧由
-      # sequence.maximum_sequence_gap 决定。
+      # 静态 B 仍由可信平直视频做逐像素 Huber 聚合。随后依次执行：
+      # 1) 从平直及弯曲的完整重建几何合成裁剪，监督 visible 和左右缺失分配；
+      # 2) 真实弯曲序列只对齐冻结的 B；
+      # 3) 在完整序列上拟合外观 score，并建立 geometry-GRU 状态记忆；
+      # 4) 冻结几何、GRU、warp 和外观分支，只训练颜色 trunk+RGB heads。
+      synthetic_warp_steps: 2500
+      warp_alignment_steps: 2500
+      # 在完整视频序列上从零状态展开 GRU，先单独拟合逐帧低秩外观系数。
+      appearance_train_steps: 100
+      color_train_steps: 30000
+      # 用启动时固定的时序 clip 监控集选择最低颜色 RMSE checkpoint，
+      # 避免随机最后一个 batch 决定最终模型。
+      color_checkpoint_interval: 250
+      color_monitor_batch_count: 8
+      # loss clip 前先读取同一视频的历史帧；颜色阶段会穿过
+      # warmup+loss clip 反向传播，使 GRU 能学到弯曲/回弹的历史差异。
       clip_length: 16
+      warmup_frames: 512
       clip_batch_size: 2
-      points_per_frame: 256
-      trusted_clip_fraction: 0.5
-      color_pretrain_learning_rate: 0.0008
+      points_per_frame: 512
+      # 合成数据只在启动时生成描述符，不增加网络结构。
+      synthetic_sequence_count: 256
+      synthetic_min_visible_fraction: 0.35
+      synthetic_warp_learning_rate: 0.0008
       warp_learning_rate: 0.0004
-      joint_learning_rate: 0.0002
+      appearance_learning_rate: 0.0004
+      color_learning_rate: 0.0002
       gradient_clip_norm: 1.0
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_epsilon: 1.0e-8
-      # softmax 无法初始化成严格 [0,1,0]；两端各留该数值作为有限 logit。
-      warp_identity_epsilon: 0.001
       base_huber_iterations: 5
       base_frame_batch_size: 8
+      # 训练完成后按每帧固定均匀点计算 identity/warp/final 对照 RMSE。
+      evaluation_points_per_frame: 2048
     loss:
-      # 可信平直视频监督 [left, visible, right]=[0,1,0]。
-      identity_weight: 5.0
-      # 非可信循环视频只使用 RGB、时间连续、循环闭合和最小裁剪先验。
+      # 只平滑真实序列的区间轨迹；旧 identity/cycle/minimum_crop 损失已删除。
+      # 真实对齐阶段继续混入少量合成区间监督，防止起点分配被绝对颜色带偏。
+      synthetic_regularization_weight: 0.02
       temporal_weight: 0.25
-      cycle_weight: 1.0
-      minimum_crop_weight: 0.02
+      # 颜色阶段冻结 geometry encoder/GRU/warp/appearance，只训练共享
+      # trunk 与 RGB heads；warp 教师项作为运行时一致性诊断保留。
+      warp_distillation_weight: 100.0
+      # 外观 PCA score 经逐维归一化、截断后由 GRU+状态记忆恢复；它既
+      # 直接重建低秩逐帧颜色场，也显式输入颜色 decoder 补偿高频残差。
+      appearance_supervision_weight: 0.02
+      appearance_score_clip: 5.0
+      # confidence 达到 0.25 时视为满权重；新救回的边界质量帧按
+      # confidence/0.25 降权，但保留最小权重以学习连续的弯曲状态。
+      frame_quality_full_confidence: 0.25
+      minimum_frame_quality_weight: 0.20
+    # 消融开关只改变对应信息通路；网络宽度、数据、随机种子和训练预算保持一致。
+    ablation:
+      use_appearance_memory: true
+      use_recurrent_history: true
+      use_local_geometry: true
     sequence:
-      # 若一段视频包含多个完整“平直->弯曲->平直”循环，修改此值；
-      # 每个视频按时间均匀切成对应数量的循环，不使用图像可信标签。
-      cycles_per_video: 1
-      cycle_sample_frames: 32
-      cycle_endpoint_frames: 3
       # 抽帧序号相差超过该值才重置 GRU；默认允许少量重建失败，因为在线路径
       # 同样会在失败帧保持旧 hidden、到下一有效几何再继续。需要硬切断时可改小。
       maximum_sequence_gap: 1000000
-    runtime:
-      # direct_fit_s 默认禁止利用当前图像在线拟合 gain/bias。
-      online_gain_bias_enabled: false
     # 会话启动仍允许拟合冻结的低频加性 Bsession。
     session_correction_max_deviation: 0.30
   calibration:
@@ -394,6 +440,9 @@ lightfield:
     # 形变帧；循环视频的任何单帧都不直接标为可信。
     trusted_flat_videos: ~/recon/assets/cali_lightfield_videos/trusted_flat.avi
     sequence_videos: ~/recon/assets/cali_lightfield_videos/flat_bend_flat.avi
+    # 完整留出视频：只参与最终前向评估，不参与 B、几何归一化、warp、PCA、
+    # GRU、状态记忆、颜色网络或 checkpoint 选择。
+    validation_sequence_videos: ~/recon/assets/cali_lightfield_videos/val.avi
     # 以下两个字段只供 physical_residual/direct_fit_3 旧模式使用。
     images: null
     videos: ~/recon/assets/cali_lightfield_videos/*.avi
@@ -414,6 +463,9 @@ lightfield:
     material_initialization_diagnostic_dir: ~/recon/assets/lightfield_calibration/material_initialization_failures
     # 初始化后的更新失败单独保存；紫色=上一有效状态，绿色=当帧重建范围。
     material_update_failure_diagnostic_dir: ~/recon/assets/lightfield_calibration/material_update_failures
+    # 每个失败帧都额外保存一张带阶段、原因和数值指标的总览图及 YAML 说明；
+    # 包括尚未得到材料候选、因而无法生成上述详细叠加图的固定外参失败。
+    failure_diagnostic_dir: ~/recon/assets/lightfield_calibration/failures
     # true：复用已导出的视频帧 PNG，以及逐帧成功观测/失败记录。只有成功与失败
     # 合计覆盖全部输入帧且源文件、配置指纹都一致时，才跳过整段分割和重建。
     reuse_existing: true

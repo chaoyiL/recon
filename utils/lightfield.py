@@ -104,8 +104,28 @@ class LightFieldModel:
     direct_s_gru_bias: Array | None = None
     direct_s_warp_weight: Array | None = None
     direct_s_warp_bias: Array | None = None
+    direct_s_length_reference_mm: Array | None = None
+    direct_s_full_visibility_threshold: Array | None = None
+    direct_s_minimum_visible_fraction: Array | None = None
+    direct_s_measurement_prior_logit_limit: Array | None = None
     direct_s_color_trunk_weights: tuple[Array,...] | None = None
     direct_s_color_trunk_biases: tuple[Array,...] | None = None
+    direct_s_appearance_mean: Array | None = None
+    direct_s_appearance_components: Array | None = None
+    direct_s_appearance_score_mean: Array | None = None
+    direct_s_appearance_score_scale: Array | None = None
+    direct_s_appearance_score_clip: Array | None = None
+    direct_s_appearance_weight: Array | None = None
+    direct_s_appearance_bias: Array | None = None
+    direct_s_appearance_memory_hidden_mean: Array | None = None
+    direct_s_appearance_memory_hidden_scale: Array | None = None
+    direct_s_appearance_memory_anchors: Array | None = None
+    direct_s_appearance_memory_residuals: Array | None = None
+    direct_s_appearance_memory_epsilon: Array | None = None
+    direct_s_appearance_memory_neighbors: int = 1
+    direct_s_use_appearance_memory: bool = True
+    direct_s_use_recurrent_history: bool = True
+    direct_s_use_local_geometry: bool = True
 
     def tree_flatten(self):
         return (self.delta, self.beta, self.bias, self.scatter_ratio,
@@ -129,20 +149,42 @@ class LightFieldModel:
                 self.direct_s_gru_bias,
                 self.direct_s_warp_weight,
                 self.direct_s_warp_bias,
+                self.direct_s_length_reference_mm,
+                self.direct_s_full_visibility_threshold,
+                self.direct_s_minimum_visible_fraction,
+                self.direct_s_measurement_prior_logit_limit,
                 self.direct_s_color_trunk_weights,
-                self.direct_s_color_trunk_biases),(
+                self.direct_s_color_trunk_biases,
+                self.direct_s_appearance_mean,
+                self.direct_s_appearance_components,
+                self.direct_s_appearance_score_mean,
+                self.direct_s_appearance_score_scale,
+                self.direct_s_appearance_score_clip,
+                self.direct_s_appearance_weight,
+                self.direct_s_appearance_bias,
+                self.direct_s_appearance_memory_hidden_mean,
+                self.direct_s_appearance_memory_hidden_scale,
+                self.direct_s_appearance_memory_anchors,
+                self.direct_s_appearance_memory_residuals,
+                self.direct_s_appearance_memory_epsilon),(
                     self.source_layout,self.background_method,
                     self.direct_geometry_descriptor_rows,
                     self.direct_curve_convexity,
                     self.direct_reconstruction_pipeline,
                     self.reconstruction_pipeline,
-                    self.material_template_sha256)
+                    self.material_template_sha256,
+                    self.direct_s_appearance_memory_neighbors,
+                    self.direct_s_use_appearance_memory,
+                    self.direct_s_use_recurrent_history,
+                    self.direct_s_use_local_geometry)
 
     @classmethod
     def tree_unflatten(cls, auxiliary, children):
         (source_layout,background_method,descriptor_rows,
          curve_convexity,reconstruction_pipeline,
-         common_reconstruction_pipeline,material_template_sha256)=auxiliary
+         common_reconstruction_pipeline,material_template_sha256,
+         appearance_memory_neighbors,use_appearance_memory,
+         use_recurrent_history,use_local_geometry)=auxiliary
         core=children[:8]
         direct=children[8:]
         return cls(
@@ -170,8 +212,28 @@ class LightFieldModel:
             direct_s_gru_bias=direct[14],
             direct_s_warp_weight=direct[15],
             direct_s_warp_bias=direct[16],
-            direct_s_color_trunk_weights=direct[17],
-            direct_s_color_trunk_biases=direct[18])
+            direct_s_length_reference_mm=direct[17],
+            direct_s_full_visibility_threshold=direct[18],
+            direct_s_minimum_visible_fraction=direct[19],
+            direct_s_measurement_prior_logit_limit=direct[20],
+            direct_s_color_trunk_weights=direct[21],
+            direct_s_color_trunk_biases=direct[22],
+            direct_s_appearance_mean=direct[23],
+            direct_s_appearance_components=direct[24],
+            direct_s_appearance_score_mean=direct[25],
+            direct_s_appearance_score_scale=direct[26],
+            direct_s_appearance_score_clip=direct[27],
+            direct_s_appearance_weight=direct[28],
+            direct_s_appearance_bias=direct[29],
+            direct_s_appearance_memory_hidden_mean=direct[30],
+            direct_s_appearance_memory_hidden_scale=direct[31],
+            direct_s_appearance_memory_anchors=direct[32],
+            direct_s_appearance_memory_residuals=direct[33],
+            direct_s_appearance_memory_epsilon=direct[34],
+            direct_s_appearance_memory_neighbors=appearance_memory_neighbors,
+            direct_s_use_appearance_memory=use_appearance_memory,
+            direct_s_use_recurrent_history=use_recurrent_history,
+            direct_s_use_local_geometry=use_local_geometry)
 
     @classmethod
     def direct_fit_3(
@@ -245,16 +307,30 @@ class LightFieldModel:
         geometry_encoder_biases: tuple[Array,...],
         gru_input_weight: Array,gru_recurrent_weight: Array,gru_bias: Array,
         warp_weight: Array,warp_bias: Array,
+        length_reference_mm: float,full_visibility_threshold: float,
+        minimum_visible_fraction: float,measurement_prior_logit_limit: float,
         color_trunk_weights: tuple[Array,...],
         color_trunk_biases: tuple[Array,...],
+        appearance_mean: Array,appearance_components: Array,
+        appearance_score_mean: Array,appearance_score_scale: Array,
+        appearance_score_clip: float,appearance_weight: Array,
+        appearance_bias: Array,
+        appearance_memory_hidden_mean: Array,
+        appearance_memory_hidden_scale: Array,
+        appearance_memory_anchors: Array,
+        appearance_memory_residuals: Array,
+        appearance_memory_neighbors: int,appearance_memory_epsilon: float,
         channel_head_weights: tuple[tuple[Array,...],...],
         channel_head_biases: tuple[tuple[Array,...],...],
         geometry_descriptor_rows: int = 32,
+        use_appearance_memory: bool = True,
+        use_recurrent_history: bool = True,
+        use_local_geometry: bool = True,
         curve_convexity: str = "none",
         reconstruction_pipeline: str = SURFACE_RECONSTRUCTION_PIPELINE_VERSION,
         source_layout: LightSourceLayout = DEFAULT_LIGHT_SOURCE_LAYOUT,
     ) -> "LightFieldModel":
-        """建立 raw geometry MLP -> GRU -> affine-s warp 的 direct_fit_s。"""
+        """建立测长先验 + raw geometry GRU + affine-s warp。"""
         if curve_convexity not in {"none","increasing","decreasing"}:
             raise ValueError(
                 "direct curve_convexity 必须是 none、increasing 或 decreasing")
@@ -262,6 +338,13 @@ class LightFieldModel:
             raise ValueError("direct reconstruction pipeline 元数据无效")
         if len(channel_head_weights)!=3 or len(channel_head_biases)!=3:
             raise ValueError("direct_fit_s 必须包含 R/G/B 三个独立 head")
+        if not np.isfinite(length_reference_mm) or length_reference_mm<=0:
+            raise ValueError("direct_fit_s 满长测量基准必须为有限正数")
+        if not 0<minimum_visible_fraction<full_visibility_threshold<=1:
+            raise ValueError("direct_fit_s 可见比例阈值无效")
+        if not np.isfinite(measurement_prior_logit_limit) \
+                or measurement_prior_logit_limit<=0:
+            raise ValueError("direct_fit_s 测长先验 logit 上限无效")
         session=jnp.asarray(session_b_coefficients,jnp.float32)
         source_count=len(light_source_specs(source_layout))
         return cls(
@@ -295,24 +378,60 @@ class LightFieldModel:
             direct_s_gru_bias=jnp.asarray(gru_bias,jnp.float32),
             direct_s_warp_weight=jnp.asarray(warp_weight,jnp.float32),
             direct_s_warp_bias=jnp.asarray(warp_bias,jnp.float32),
+            direct_s_length_reference_mm=jnp.asarray(
+                length_reference_mm,jnp.float32),
+            direct_s_full_visibility_threshold=jnp.asarray(
+                full_visibility_threshold,jnp.float32),
+            direct_s_minimum_visible_fraction=jnp.asarray(
+                minimum_visible_fraction,jnp.float32),
+            direct_s_measurement_prior_logit_limit=jnp.asarray(
+                measurement_prior_logit_limit,jnp.float32),
             direct_s_color_trunk_weights=tuple(
                 jnp.asarray(value,jnp.float32) for value in color_trunk_weights),
             direct_s_color_trunk_biases=tuple(
-                jnp.asarray(value,jnp.float32) for value in color_trunk_biases))
+                jnp.asarray(value,jnp.float32) for value in color_trunk_biases),
+            direct_s_appearance_mean=jnp.asarray(
+                appearance_mean,jnp.float32),
+            direct_s_appearance_components=jnp.asarray(
+                appearance_components,jnp.float32),
+            direct_s_appearance_score_mean=jnp.asarray(
+                appearance_score_mean,jnp.float32),
+            direct_s_appearance_score_scale=jnp.asarray(
+                appearance_score_scale,jnp.float32),
+            direct_s_appearance_score_clip=jnp.asarray(
+                appearance_score_clip,jnp.float32),
+            direct_s_appearance_weight=jnp.asarray(
+                appearance_weight,jnp.float32),
+            direct_s_appearance_bias=jnp.asarray(
+                appearance_bias,jnp.float32),
+            direct_s_appearance_memory_hidden_mean=jnp.asarray(
+                appearance_memory_hidden_mean,jnp.float32),
+            direct_s_appearance_memory_hidden_scale=jnp.asarray(
+                appearance_memory_hidden_scale,jnp.float32),
+            direct_s_appearance_memory_anchors=jnp.asarray(
+                appearance_memory_anchors,jnp.float32),
+            direct_s_appearance_memory_residuals=jnp.asarray(
+                appearance_memory_residuals,jnp.float32),
+            direct_s_appearance_memory_epsilon=jnp.asarray(
+                appearance_memory_epsilon,jnp.float32),
+            direct_s_appearance_memory_neighbors=appearance_memory_neighbors,
+            direct_s_use_appearance_memory=use_appearance_memory,
+            direct_s_use_recurrent_history=use_recurrent_history,
+            direct_s_use_local_geometry=use_local_geometry)
 
     @classmethod
     def load(cls, path: str | Path, device: jax.Device | None = None) -> "LightFieldModel":
         with Path(path).expanduser().open("r", encoding="utf-8") as stream:
             raw = yaml.safe_load(stream)
         version=raw.get("format_version")
-        if version not in {22,25,26}:
+        if version not in {22,25,33}:
             raise ValueError("光场模型版本已经过期；请重新运行 calibrate-lightfield")
         background_method=raw.get("background_method")
         if background_method not in {
                 "physical_residual","direct_fit_3","direct_fit_s"}:
             raise ValueError("光场模型包含无效 background_method")
         expected_version={
-            "physical_residual":22,"direct_fit_3":25,"direct_fit_s":26}[
+            "physical_residual":22,"direct_fit_3":25,"direct_fit_s":33}[
                 background_method]
         if version!=expected_version:
             raise ValueError(
@@ -489,8 +608,11 @@ class LightFieldModel:
                     reconstruction_pipeline=reconstruction_pipeline,
                     source_layout=source_layout)
             else:
-                if raw.get("direct_warp_mode")!="affine_s_softmax_interval" \
-                        or raw.get("direct_recurrent_mode")!="single_gru":
+                if raw.get("direct_warp_mode") \
+                        !="affine_s_measured_prior_learned_interval" \
+                    or raw.get("direct_recurrent_mode")!="single_gru" \
+                    or raw.get("direct_color_conditioning_mode") \
+                        !="geometry_gru_explicit_appearance_state":
                     raise ValueError("direct_fit_s 的 warp/GRU 语义无效")
                 gru_input=np.asarray(
                     raw.get("direct_s_gru_input_weight"),np.float32)
@@ -500,26 +622,117 @@ class LightFieldModel:
                 warp_weight=np.asarray(
                     raw.get("direct_s_warp_weight"),np.float32)
                 warp_bias=np.asarray(raw.get("direct_s_warp_bias"),np.float32)
+                length_reference=float(
+                    raw.get("direct_s_length_reference_mm",np.nan))
+                full_visibility_threshold=float(
+                    raw.get("direct_s_full_visibility_threshold",np.nan))
+                minimum_visible_fraction=float(
+                    raw.get("direct_s_minimum_visible_fraction",np.nan))
+                measurement_prior_logit_limit=float(
+                    raw.get("direct_s_measurement_prior_logit_limit",np.nan))
                 trunk_weights=tuple(np.asarray(value,np.float32) for value in
                     raw.get("direct_s_color_trunk_weights",[]))
                 trunk_biases=tuple(np.asarray(value,np.float32) for value in
                     raw.get("direct_s_color_trunk_biases",[]))
-                if gru_input.ndim!=2 or gru_input.shape[0]!=latent_count \
+                appearance_mean=np.asarray(
+                    raw.get("direct_s_appearance_mean"),np.float32)
+                appearance_components=np.asarray(
+                    raw.get("direct_s_appearance_components"),np.float32)
+                appearance_score_mean=np.asarray(
+                    raw.get("direct_s_appearance_score_mean"),np.float32)
+                appearance_score_scale=np.asarray(
+                    raw.get("direct_s_appearance_score_scale"),np.float32)
+                appearance_score_clip=float(
+                    raw.get("direct_s_appearance_score_clip",np.nan))
+                appearance_weight=np.asarray(
+                    raw.get("direct_s_appearance_weight"),np.float32)
+                appearance_bias=np.asarray(
+                    raw.get("direct_s_appearance_bias"),np.float32)
+                memory_hidden_mean=np.asarray(
+                    raw.get("direct_s_appearance_memory_hidden_mean"),
+                    np.float32)
+                memory_hidden_scale=np.asarray(
+                    raw.get("direct_s_appearance_memory_hidden_scale"),
+                    np.float32)
+                memory_anchors=np.asarray(
+                    raw.get("direct_s_appearance_memory_anchors"),np.float32)
+                memory_residuals=np.asarray(
+                    raw.get("direct_s_appearance_memory_residuals"),np.float32)
+                memory_neighbors=raw.get(
+                    "direct_s_appearance_memory_neighbors")
+                memory_epsilon=float(raw.get(
+                    "direct_s_appearance_memory_epsilon",np.nan))
+                use_appearance_memory=raw.get(
+                    "direct_s_use_appearance_memory",True)
+                use_recurrent_history=raw.get(
+                    "direct_s_use_recurrent_history",True)
+                use_local_geometry=raw.get(
+                    "direct_s_use_local_geometry",True)
+                if not all(isinstance(value,bool) for value in (
+                        use_appearance_memory,use_recurrent_history,
+                        use_local_geometry)):
+                    raise ValueError("direct_fit_s 消融元数据无效")
+                if gru_input.ndim!=2 or gru_input.shape[0]!=latent_count+1 \
                         or gru_input.shape[1]%3!=0:
                     raise ValueError("direct_fit_s GRU 输入权重尺寸无效")
                 hidden_count=gru_input.shape[1]//3
+                appearance_count=appearance_components.shape[0] \
+                    if appearance_components.ndim==4 else -1
                 if gru_recurrent.shape!=(hidden_count,3*hidden_count) \
                         or gru_bias.shape!=(3*hidden_count,) \
-                        or warp_weight.shape!=(hidden_count,3) \
-                        or warp_bias.shape!=(3,) \
+                        or warp_weight.shape!=(hidden_count,2) \
+                        or warp_bias.shape!=(2,) \
                         or not all(np.isfinite(value).all() for value in (
                             gru_input,gru_recurrent,gru_bias,warp_weight,
-                            warp_bias)):
+                            warp_bias)) \
+                        or not np.isfinite(length_reference) \
+                        or not np.isfinite(full_visibility_threshold) \
+                        or not np.isfinite(minimum_visible_fraction) \
+                        or not np.isfinite(measurement_prior_logit_limit) \
+                        or length_reference<=0 \
+                        or measurement_prior_logit_limit<=0 \
+                        or not 0<minimum_visible_fraction \
+                            <full_visibility_threshold<=1:
                     raise ValueError("direct_fit_s GRU/warp 权重尺寸无效")
+                if appearance_mean.ndim!=3 \
+                        or appearance_mean.shape[-1]!=3 \
+                        or min(appearance_mean.shape[:2])<2 \
+                        or appearance_components.shape!=(
+                            appearance_count,*appearance_mean.shape) \
+                        or appearance_count<1 \
+                        or appearance_score_mean.shape!=(appearance_count,) \
+                        or appearance_score_scale.shape!=(appearance_count,) \
+                        or appearance_weight.shape!=(hidden_count,
+                                                     appearance_count) \
+                        or appearance_bias.shape!=(appearance_count,) \
+                        or not np.isfinite(appearance_score_clip) \
+                        or appearance_score_clip<=0 \
+                        or np.any(appearance_score_scale<=0) \
+                        or not all(np.isfinite(value).all() for value in (
+                            appearance_mean,appearance_components,
+                            appearance_score_mean,appearance_score_scale,
+                            appearance_weight,appearance_bias)):
+                    raise ValueError("direct_fit_s 低秩外观分支无效")
+                if memory_hidden_mean.shape!=(hidden_count,) \
+                        or memory_hidden_scale.shape!=(hidden_count,) \
+                        or memory_anchors.ndim!=2 \
+                        or memory_anchors.shape[1]!=hidden_count \
+                        or memory_residuals.shape!=(
+                            memory_anchors.shape[0],appearance_count) \
+                        or not isinstance(memory_neighbors,int) \
+                        or isinstance(memory_neighbors,bool) \
+                        or not 1<=memory_neighbors<=memory_anchors.shape[0] \
+                        or not np.isfinite(memory_epsilon) \
+                        or memory_epsilon<=0 \
+                        or np.any(memory_hidden_scale<=0) \
+                        or not all(np.isfinite(value).all() for value in (
+                            memory_hidden_mean,memory_hidden_scale,
+                            memory_anchors,memory_residuals)):
+                    raise ValueError("direct_fit_s 外观状态记忆无效")
                 color_input_count=(2+4*frequencies.size+latent_count
                                    +pca_components.shape[1]
                                    +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT
-                                   +hidden_count)
+                                   +hidden_count+appearance_count)
                 if not trunk_weights or len(trunk_weights)!=len(trunk_biases):
                     raise ValueError("direct_fit_s 共享颜色 trunk 无效")
                 previous=color_input_count
@@ -563,11 +776,32 @@ class LightFieldModel:
                     gru_input_weight=gru_input,
                     gru_recurrent_weight=gru_recurrent,gru_bias=gru_bias,
                     warp_weight=warp_weight,warp_bias=warp_bias,
+                    length_reference_mm=length_reference,
+                    full_visibility_threshold=full_visibility_threshold,
+                    minimum_visible_fraction=minimum_visible_fraction,
+                    measurement_prior_logit_limit=
+                        measurement_prior_logit_limit,
                     color_trunk_weights=trunk_weights,
                     color_trunk_biases=trunk_biases,
+                    appearance_mean=appearance_mean,
+                    appearance_components=appearance_components,
+                    appearance_score_mean=appearance_score_mean,
+                    appearance_score_scale=appearance_score_scale,
+                    appearance_score_clip=appearance_score_clip,
+                    appearance_weight=appearance_weight,
+                    appearance_bias=appearance_bias,
+                    appearance_memory_hidden_mean=memory_hidden_mean,
+                    appearance_memory_hidden_scale=memory_hidden_scale,
+                    appearance_memory_anchors=memory_anchors,
+                    appearance_memory_residuals=memory_residuals,
+                    appearance_memory_neighbors=memory_neighbors,
+                    appearance_memory_epsilon=memory_epsilon,
                     channel_head_weights=channel_decoder_weights,
                     channel_head_biases=channel_decoder_biases,
                     geometry_descriptor_rows=descriptor_rows,
+                    use_appearance_memory=use_appearance_memory,
+                    use_recurrent_history=use_recurrent_history,
+                    use_local_geometry=use_local_geometry,
                     curve_convexity=curve_convexity,
                     reconstruction_pipeline=reconstruction_pipeline,
                     source_layout=source_layout)
@@ -660,7 +894,7 @@ class LightFieldModel:
                 or len(self.material_template_sha256)!=64:
             raise ValueError("保存光场模型前必须绑定材料模板 SHA-256")
         format_version={
-            "physical_residual":22,"direct_fit_3":25,"direct_fit_s":26}[
+            "physical_residual":22,"direct_fit_3":25,"direct_fit_s":33}[
                 self.background_method]
         data = {"format_version":format_version,
                 "background_method":self.background_method,
@@ -813,28 +1047,108 @@ class LightFieldModel:
                 gru_bias=np.asarray(self.direct_s_gru_bias)
                 warp_weight=np.asarray(self.direct_s_warp_weight)
                 warp_bias=np.asarray(self.direct_s_warp_bias)
+                length_reference=np.asarray(
+                    self.direct_s_length_reference_mm)
+                full_visibility_threshold=np.asarray(
+                    self.direct_s_full_visibility_threshold)
+                minimum_visible_fraction=np.asarray(
+                    self.direct_s_minimum_visible_fraction)
+                measurement_prior_logit_limit=np.asarray(
+                    self.direct_s_measurement_prior_logit_limit)
                 trunk_weights=tuple(np.asarray(value) for value in (
                     self.direct_s_color_trunk_weights or ()))
                 trunk_biases=tuple(np.asarray(value) for value in (
                     self.direct_s_color_trunk_biases or ()))
-                if gru_input.ndim!=2 or gru_input.shape[0]!=latent_count \
+                appearance_mean=np.asarray(self.direct_s_appearance_mean)
+                appearance_components=np.asarray(
+                    self.direct_s_appearance_components)
+                appearance_score_mean=np.asarray(
+                    self.direct_s_appearance_score_mean)
+                appearance_score_scale=np.asarray(
+                    self.direct_s_appearance_score_scale)
+                appearance_score_clip=np.asarray(
+                    self.direct_s_appearance_score_clip)
+                appearance_weight=np.asarray(
+                    self.direct_s_appearance_weight)
+                appearance_bias=np.asarray(self.direct_s_appearance_bias)
+                memory_hidden_mean=np.asarray(
+                    self.direct_s_appearance_memory_hidden_mean)
+                memory_hidden_scale=np.asarray(
+                    self.direct_s_appearance_memory_hidden_scale)
+                memory_anchors=np.asarray(
+                    self.direct_s_appearance_memory_anchors)
+                memory_residuals=np.asarray(
+                    self.direct_s_appearance_memory_residuals)
+                memory_neighbors=self.direct_s_appearance_memory_neighbors
+                memory_epsilon=np.asarray(
+                    self.direct_s_appearance_memory_epsilon)
+                if gru_input.ndim!=2 or gru_input.shape[0]!=latent_count+1 \
                         or gru_input.shape[1]%3!=0:
                     raise ValueError("direct_fit_s GRU 输入权重尺寸无效")
                 hidden_count=gru_input.shape[1]//3
+                appearance_count=appearance_components.shape[0] \
+                    if appearance_components.ndim==4 else -1
                 if gru_recurrent.shape!=(hidden_count,3*hidden_count) \
                         or gru_bias.shape!=(3*hidden_count,) \
-                        or warp_weight.shape!=(hidden_count,3) \
-                        or warp_bias.shape!=(3,) \
+                        or warp_weight.shape!=(hidden_count,2) \
+                        or warp_bias.shape!=(2,) \
                         or not all(np.isfinite(value).all() for value in (
                             gru_input,gru_recurrent,gru_bias,warp_weight,
-                            warp_bias)):
+                            warp_bias,length_reference,
+                            full_visibility_threshold,
+                            minimum_visible_fraction,
+                            measurement_prior_logit_limit)) \
+                        or length_reference.shape!=() \
+                        or full_visibility_threshold.shape!=() \
+                        or minimum_visible_fraction.shape!=() \
+                        or measurement_prior_logit_limit.shape!=() \
+                        or float(length_reference)<=0 \
+                        or float(measurement_prior_logit_limit)<=0 \
+                        or not 0<float(minimum_visible_fraction) \
+                            <float(full_visibility_threshold)<=1:
                     raise ValueError("direct_fit_s GRU/warp 权重尺寸无效")
                 color_input_count=(2+4*frequencies.size+latent_count
                                    +pca_components.shape[1]
                                    +DIRECT_LOCAL_GEOMETRY_FEATURE_COUNT
-                                   +hidden_count)
+                                   +hidden_count+appearance_count)
                 if not trunk_weights or len(trunk_weights)!=len(trunk_biases):
                     raise ValueError("direct_fit_s 共享颜色 trunk 无效")
+                if appearance_mean.ndim!=3 \
+                        or appearance_mean.shape[-1]!=3 \
+                        or min(appearance_mean.shape[:2])<2 \
+                        or appearance_components.shape!=(
+                            appearance_count,*appearance_mean.shape) \
+                        or appearance_count<1 \
+                        or appearance_score_mean.shape!=(appearance_count,) \
+                        or appearance_score_scale.shape!=(appearance_count,) \
+                        or appearance_weight.shape!=(hidden_count,
+                                                     appearance_count) \
+                        or appearance_bias.shape!=(appearance_count,) \
+                        or appearance_score_clip.shape!=() \
+                        or float(appearance_score_clip)<=0 \
+                        or np.any(appearance_score_scale<=0) \
+                        or not all(np.isfinite(value).all() for value in (
+                            appearance_mean,appearance_components,
+                            appearance_score_mean,appearance_score_scale,
+                            appearance_score_clip,appearance_weight,
+                            appearance_bias)):
+                    raise ValueError("direct_fit_s 低秩外观分支无效")
+                if memory_hidden_mean.shape!=(hidden_count,) \
+                        or memory_hidden_scale.shape!=(hidden_count,) \
+                        or memory_anchors.ndim!=2 \
+                        or memory_anchors.shape[1]!=hidden_count \
+                        or memory_residuals.shape!=(
+                            memory_anchors.shape[0],appearance_count) \
+                        or not isinstance(memory_neighbors,int) \
+                        or isinstance(memory_neighbors,bool) \
+                        or not 1<=memory_neighbors<=memory_anchors.shape[0] \
+                        or memory_epsilon.shape!=() \
+                        or float(memory_epsilon)<=0 \
+                        or np.any(memory_hidden_scale<=0) \
+                        or not all(np.isfinite(value).all() for value in (
+                            memory_hidden_mean,memory_hidden_scale,
+                            memory_anchors,memory_residuals,memory_epsilon)):
+                    raise ValueError("direct_fit_s 外观状态记忆无效")
                 previous=color_input_count
                 for weight,layer_bias in zip(
                         trunk_weights,trunk_biases,strict=True):
@@ -895,17 +1209,55 @@ class LightFieldModel:
             if self.background_method=="direct_fit_s":
                 data.update({
                     "direct_recurrent_mode":"single_gru",
+                    "direct_color_conditioning_mode":
+                        "geometry_gru_explicit_appearance_state",
                     "direct_s_gru_gate_order":["update","reset","candidate"],
-                    "direct_warp_mode":"affine_s_softmax_interval",
+                    "direct_warp_mode":
+                        "affine_s_measured_prior_learned_interval",
                     "direct_s_gru_input_weight":gru_input.tolist(),
                     "direct_s_gru_recurrent_weight":gru_recurrent.tolist(),
                     "direct_s_gru_bias":gru_bias.tolist(),
                     "direct_s_warp_weight":warp_weight.tolist(),
                     "direct_s_warp_bias":warp_bias.tolist(),
+                    "direct_s_length_reference_mm":float(length_reference),
+                    "direct_s_full_visibility_threshold":float(
+                        full_visibility_threshold),
+                    "direct_s_minimum_visible_fraction":float(
+                        minimum_visible_fraction),
+                    "direct_s_measurement_prior_logit_limit":float(
+                        measurement_prior_logit_limit),
                     "direct_s_color_trunk_weights":[
                         value.tolist() for value in trunk_weights],
                     "direct_s_color_trunk_biases":[
-                        value.tolist() for value in trunk_biases]})
+                        value.tolist() for value in trunk_biases],
+                    "direct_s_appearance_mean":appearance_mean.tolist(),
+                    "direct_s_appearance_components":
+                        appearance_components.tolist(),
+                    "direct_s_appearance_score_mean":
+                        appearance_score_mean.tolist(),
+                    "direct_s_appearance_score_scale":
+                        appearance_score_scale.tolist(),
+                    "direct_s_appearance_score_clip":float(
+                        appearance_score_clip),
+                    "direct_s_appearance_weight":appearance_weight.tolist(),
+                    "direct_s_appearance_bias":appearance_bias.tolist(),
+                    "direct_s_appearance_memory_hidden_mean":
+                        memory_hidden_mean.tolist(),
+                    "direct_s_appearance_memory_hidden_scale":
+                        memory_hidden_scale.tolist(),
+                    "direct_s_appearance_memory_anchors":
+                        memory_anchors.tolist(),
+                    "direct_s_appearance_memory_residuals":
+                        memory_residuals.tolist(),
+                    "direct_s_appearance_memory_neighbors":memory_neighbors,
+                    "direct_s_appearance_memory_epsilon":float(
+                        memory_epsilon),
+                    "direct_s_use_appearance_memory":
+                        self.direct_s_use_appearance_memory,
+                    "direct_s_use_recurrent_history":
+                        self.direct_s_use_recurrent_history,
+                    "direct_s_use_local_geometry":
+                        self.direct_s_use_local_geometry})
         temporary = output.with_suffix(output.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as stream:
             yaml.safe_dump(data, stream, allow_unicode=True, sort_keys=False)
@@ -1364,22 +1716,76 @@ def direct_background_field_jax(
     return direct_background_rgb_jax(jnp.stack([s,t],axis=-1),xyz,model)
 
 
+def direct_s_observed_length_jax(raw_observed_xyz: Array) -> Array:
+    """计算未做 55 mm 拉伸前的三维中心线弧长。"""
+    curve=jnp.asarray(raw_observed_xyz)[:,0,1:3]
+    return jnp.sum(jnp.linalg.norm(jnp.diff(curve,axis=0),axis=-1))
+
+
+def direct_s_visible_fraction_jax(
+    raw_observed_xyz: Array,length_reference_mm: Array,
+    full_visibility_threshold: Array,minimum_visible_fraction: Array,
+) -> Array:
+    """由原始弧长给出可见比例先验，供 WarpNet 学习修正。"""
+    ratio=direct_s_observed_length_jax(raw_observed_xyz) \
+        /jnp.maximum(jnp.asarray(length_reference_mm),1e-6)
+    clipped=jnp.clip(
+        ratio,jnp.asarray(minimum_visible_fraction),jnp.asarray(1.))
+    return jnp.where(
+        ratio>=jnp.asarray(full_visibility_threshold),jnp.asarray(1.),clipped)
+
+
+def direct_s_interval_from_logits_jax(
+    measured_visible: Array,warp_logits: Array,minimum_visible_fraction: Array,
+    measurement_prior_logit_limit: Array,
+) -> Array:
+    """以测长为先验，由两个 logit 修正 visible 并分配两侧缺失。"""
+    logits=jnp.asarray(warp_logits)
+    side_fraction=jax.nn.sigmoid(logits[...,0])
+    minimum=jnp.asarray(minimum_visible_fraction)
+    prior_unit=(jnp.asarray(measured_visible)-minimum) \
+        /jnp.maximum(1-minimum,1e-6)
+    limit=jnp.asarray(measurement_prior_logit_limit)
+    minimum_prior=jax.nn.sigmoid(-limit)
+    prior_unit=jnp.clip(prior_unit,minimum_prior,1-minimum_prior)
+    prior_logit=jnp.log(prior_unit)-jnp.log1p(-prior_unit)
+    visible_unit=jax.nn.sigmoid(prior_logit+logits[...,1])
+    visible=minimum+(1-minimum)*visible_unit
+    missing=1-visible
+    left=missing*side_fraction
+    return jnp.stack([left,visible,missing-left],axis=-1)
+
+
 def direct_s_recurrent_step_jax(
     raw_observed_xyz: Array,previous_hidden: Array,model: LightFieldModel,
 ) -> tuple[Array,Array,Array,Array]:
-    """用归一化前的观测几何推进 GRU，并返回 [left,visible,right]。"""
+    """用归一化前几何推进 GRU；弧长作先验，GRU 修正区间。"""
     required=(model.direct_s_gru_input_weight,
               model.direct_s_gru_recurrent_weight,
               model.direct_s_gru_bias,model.direct_s_warp_weight,
-              model.direct_s_warp_bias)
+              model.direct_s_warp_bias,model.direct_s_length_reference_mm,
+              model.direct_s_full_visibility_threshold,
+              model.direct_s_minimum_visible_fraction,
+              model.direct_s_measurement_prior_logit_limit)
     if model.background_method!="direct_fit_s" \
             or any(value is None for value in required):
         raise ValueError("当前模型不包含 direct_fit_s GRU/warp")
     latent,pca=direct_geometry_conditions_jax(raw_observed_xyz,model)
+    assert model.direct_s_length_reference_mm is not None
+    assert model.direct_s_full_visibility_threshold is not None
+    assert model.direct_s_minimum_visible_fraction is not None
+    assert model.direct_s_measurement_prior_logit_limit is not None
+    visible=direct_s_visible_fraction_jax(
+        raw_observed_xyz,model.direct_s_length_reference_mm,
+        model.direct_s_full_visibility_threshold,
+        model.direct_s_minimum_visible_fraction)
     assert model.direct_s_gru_input_weight is not None
     assert model.direct_s_gru_recurrent_weight is not None
     assert model.direct_s_gru_bias is not None
-    input_gates=(latent@model.direct_s_gru_input_weight
+    if not model.direct_s_use_recurrent_history:
+        previous_hidden=jnp.zeros_like(previous_hidden)
+    recurrent_input=jnp.concatenate([latent,visible[None]],axis=-1)
+    input_gates=(recurrent_input@model.direct_s_gru_input_weight
                  +model.direct_s_gru_bias)
     recurrent_gates=previous_hidden@model.direct_s_gru_recurrent_weight
     input_update,input_reset,input_candidate=jnp.split(input_gates,3,axis=-1)
@@ -1392,8 +1798,10 @@ def direct_s_recurrent_step_jax(
     hidden=update*previous_hidden+(1-update)*candidate
     assert model.direct_s_warp_weight is not None
     assert model.direct_s_warp_bias is not None
-    interval=jax.nn.softmax(
-        hidden@model.direct_s_warp_weight+model.direct_s_warp_bias,axis=-1)
+    interval=direct_s_interval_from_logits_jax(
+        visible,hidden@model.direct_s_warp_weight+model.direct_s_warp_bias,
+        model.direct_s_minimum_visible_fraction,
+        model.direct_s_measurement_prior_logit_limit)
     return hidden,interval,latent,pca
 
 
@@ -1407,9 +1815,64 @@ def direct_s_warp_coordinates_jax(
     return jnp.stack([warped_s,coordinates[...,1]],axis=-1)
 
 
+def direct_s_normalized_appearance_scores_jax(
+    hidden: Array,model: LightFieldModel,
+) -> Array:
+    """从冻结 GRU 状态读取参数化外观，并按需叠加训练状态记忆。"""
+    required=(model.direct_s_appearance_weight,
+              model.direct_s_appearance_bias,
+              model.direct_s_appearance_memory_hidden_mean,
+              model.direct_s_appearance_memory_hidden_scale,
+              model.direct_s_appearance_memory_anchors,
+              model.direct_s_appearance_memory_residuals,
+              model.direct_s_appearance_memory_epsilon)
+    if model.background_method!="direct_fit_s" \
+            or any(value is None for value in required):
+        raise ValueError("当前模型不包含 direct_fit_s 外观状态")
+    assert model.direct_s_appearance_weight is not None
+    assert model.direct_s_appearance_bias is not None
+    normalized_scores=jnp.tanh(
+        hidden@model.direct_s_appearance_weight
+        +model.direct_s_appearance_bias)
+    if not model.direct_s_use_appearance_memory:
+        return normalized_scores
+    assert model.direct_s_appearance_memory_hidden_mean is not None
+    assert model.direct_s_appearance_memory_hidden_scale is not None
+    assert model.direct_s_appearance_memory_anchors is not None
+    assert model.direct_s_appearance_memory_residuals is not None
+    assert model.direct_s_appearance_memory_epsilon is not None
+    query=(hidden-model.direct_s_appearance_memory_hidden_mean) \
+        /model.direct_s_appearance_memory_hidden_scale
+    squared_distance=jnp.sum(
+        (query[...,None,:]-model.direct_s_appearance_memory_anchors)**2,
+        axis=-1)
+    _,indices=jax.lax.top_k(
+        -squared_distance,model.direct_s_appearance_memory_neighbors)
+    selected_distance=jnp.take_along_axis(
+        squared_distance,indices,axis=-1)
+    memory_weights=1/(selected_distance
+                      +model.direct_s_appearance_memory_epsilon)
+    memory_weights/=jnp.sum(memory_weights,axis=-1,keepdims=True)
+    return jnp.clip(normalized_scores+jnp.sum(
+        model.direct_s_appearance_memory_residuals[indices]
+        *memory_weights[...,None],axis=-2),-1.,1.)
+
+
 def direct_s_background_rgb_jax(
     coordinates: Array,surface_xyz: Array,raw_observed_xyz: Array,
     hidden: Array,interval: Array,model: LightFieldModel,
+) -> Array:
+    """使用模型预测的外观系数求值 direct_fit_s 背景。"""
+    normalized_scores=direct_s_normalized_appearance_scores_jax(hidden,model)
+    return direct_s_background_rgb_with_scores_jax(
+        coordinates,surface_xyz,raw_observed_xyz,hidden,interval,
+        normalized_scores,model)
+
+
+def direct_s_background_rgb_with_scores_jax(
+    coordinates: Array,surface_xyz: Array,raw_observed_xyz: Array,
+    hidden: Array,interval: Array,normalized_scores: Array,
+    model: LightFieldModel,
 ) -> Array:
     """求值带单调仿射 s-warp、共享 trunk 和独立 RGB head 的背景。"""
     required=(model.direct_base_texture,model.direct_coordinate_frequencies,
@@ -1417,6 +1880,11 @@ def direct_s_background_rgb_jax(
               model.direct_local_geometry_feature_scale,
               model.direct_s_color_trunk_weights,
               model.direct_s_color_trunk_biases,
+              model.direct_s_appearance_mean,
+              model.direct_s_appearance_components,
+              model.direct_s_appearance_score_mean,
+              model.direct_s_appearance_score_scale,
+              model.direct_s_appearance_score_clip,
               model.direct_channel_decoder_weights,
               model.direct_channel_decoder_biases)
     if model.background_method!="direct_fit_s" \
@@ -1432,6 +1900,8 @@ def direct_s_background_rgb_jax(
     local=(direct_local_geometry_features_jax(surface_xyz,coordinates)
            -model.direct_local_geometry_feature_mean) \
         /model.direct_local_geometry_feature_scale
+    if not model.direct_s_use_local_geometry:
+        local=jnp.zeros_like(local)
 
     def broadcast(value: Array) -> Array:
         return jnp.broadcast_to(
@@ -1439,7 +1909,7 @@ def direct_s_background_rgb_jax(
 
     network_input=jnp.concatenate([
         coordinate_features,broadcast(latent),broadcast(pca),local,
-        broadcast(hidden)],axis=-1)
+        broadcast(hidden),broadcast(normalized_scores)],axis=-1)
     values=network_input
     assert model.direct_s_color_trunk_weights is not None
     assert model.direct_s_color_trunk_biases is not None
@@ -1467,8 +1937,21 @@ def direct_s_background_rgb_jax(
         head(weights,biases) for weights,biases in zip(
             model.direct_channel_decoder_weights,
             model.direct_channel_decoder_biases,strict=True)],axis=-1)
+    assert model.direct_s_appearance_score_mean is not None
+    assert model.direct_s_appearance_score_scale is not None
+    assert model.direct_s_appearance_score_clip is not None
+    scores=(model.direct_s_appearance_score_mean
+            +normalized_scores*model.direct_s_appearance_score_clip
+            *model.direct_s_appearance_score_scale)
+    assert model.direct_s_appearance_mean is not None
+    assert model.direct_s_appearance_components is not None
+    appearance_field=(model.direct_s_appearance_mean+jnp.reshape(
+        scores@jnp.reshape(model.direct_s_appearance_components,(
+            model.direct_s_appearance_components.shape[0],-1)),
+        model.direct_s_appearance_mean.shape))
     assert model.direct_base_texture is not None
-    base=sample_direct_base_texture_jax(model.direct_base_texture,warped)
+    base=(sample_direct_base_texture_jax(model.direct_base_texture,warped)
+          +sample_direct_base_texture_jax(appearance_field,coordinates))
     epsilon=jnp.asarray(1e-4,base.dtype)
     base=jnp.clip(base,epsilon,1-epsilon)
     return jax.nn.sigmoid(jnp.log(base)-jnp.log1p(-base)+delta)

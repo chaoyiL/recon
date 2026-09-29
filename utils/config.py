@@ -73,38 +73,55 @@ class DirectFitSConfig:
     geometry_latent_dimensions: int
     geometry_pca_dimensions: int
     gru_hidden_dimensions: int
+    appearance_descriptor_rows: int
+    appearance_descriptor_columns: int
+    appearance_pca_dimensions: int
+    appearance_minimum_coverage: float
+    appearance_memory_neighbors: int
+    appearance_memory_epsilon: float
     color_trunk_width: int
     color_trunk_layers: int
     color_head_width: int
     color_head_layers: int
-    color_pretrain_steps: int
-    warp_train_steps: int
-    joint_finetune_steps: int
+    synthetic_warp_steps: int
+    warp_alignment_steps: int
+    appearance_train_steps: int
+    color_train_steps: int
+    color_checkpoint_interval: int
+    color_monitor_batch_count: int
     clip_length: int
+    warmup_frames: int
     clip_batch_size: int
     points_per_frame: int
-    trusted_clip_fraction: float
-    color_pretrain_learning_rate: float
+    synthetic_sequence_count: int
+    synthetic_min_visible_fraction: float
+    synthetic_warp_learning_rate: float
     warp_learning_rate: float
-    joint_learning_rate: float
+    appearance_learning_rate: float
+    color_learning_rate: float
     gradient_clip_norm: float
     adam_beta1: float
     adam_beta2: float
     adam_epsilon: float
-    warp_identity_epsilon: float
     base_huber_iterations: int
     base_frame_batch_size: int
-    identity_weight: float
+    full_visibility_threshold: float
+    minimum_visible_fraction: float
+    measurement_prior_logit_limit: float
+    synthetic_regularization_weight: float
     temporal_weight: float
-    cycle_weight: float
-    minimum_crop_weight: float
-    cycles_per_video: int
-    cycle_sample_frames: int
-    cycle_endpoint_frames: int
+    warp_distillation_weight: float
+    appearance_supervision_weight: float
+    appearance_score_clip: float
+    frame_quality_full_confidence: float
+    minimum_frame_quality_weight: float
+    use_appearance_memory: bool
+    use_recurrent_history: bool
+    use_local_geometry: bool
     maximum_sequence_gap: int
+    evaluation_points_per_frame: int
     sample_erode_pixels: int
     session_correction_max_deviation: float
-    online_gain_bias_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -395,8 +412,8 @@ def parse_direct_fit_s_config(lightfield: Mapping[str,Any]) -> DirectFitSConfig:
     if not isinstance(direct,Mapping):
         raise ConfigError(f"lightfield.{section_name} 必须是字典")
     unknown=set(direct)-{
-        "neural_field","training","loss","sequence","sample_filter",
-        "runtime","session_correction_max_deviation"}
+        "neural_field","training","measurement","loss","sequence","sample_filter",
+        "ablation","session_correction_max_deviation"}
     if unknown:
         raise ConfigError(
             f"lightfield.{section_name} 包含未知字段: {sorted(unknown)}")
@@ -409,38 +426,51 @@ def parse_direct_fit_s_config(lightfield: Mapping[str,Any]) -> DirectFitSConfig:
 
     field=mapping("neural_field")
     training=mapping("training")
+    measurement=mapping("measurement")
     loss=mapping("loss")
     sequence=mapping("sequence")
+    ablation=mapping("ablation")
     sample_filter=mapping("sample_filter")
-    runtime=mapping("runtime")
     known={
         "neural_field":{
             "frequencies","geometry_descriptor_rows",
             "geometry_encoder_width","geometry_encoder_layers",
             "geometry_latent_dimensions","geometry_pca_dimensions",
-            "gru_hidden_dimensions","color_trunk_width",
+            "gru_hidden_dimensions","appearance_descriptor_rows",
+            "appearance_descriptor_columns","appearance_pca_dimensions",
+            "appearance_minimum_coverage",
+            "appearance_memory_neighbors","appearance_memory_epsilon",
+            "color_trunk_width",
             "color_trunk_layers","color_head_width","color_head_layers"},
         "training":{
-            "color_pretrain_steps","warp_train_steps",
-            "joint_finetune_steps","clip_length","clip_batch_size",
-            "points_per_frame","trusted_clip_fraction",
-            "color_pretrain_learning_rate","warp_learning_rate",
-            "joint_learning_rate","gradient_clip_norm",
+            "synthetic_warp_steps","warp_alignment_steps",
+            "appearance_train_steps","color_train_steps",
+            "color_checkpoint_interval",
+            "color_monitor_batch_count","clip_length","warmup_frames",
+            "clip_batch_size","points_per_frame",
+            "synthetic_sequence_count","synthetic_min_visible_fraction",
+            "synthetic_warp_learning_rate","warp_learning_rate",
+            "appearance_learning_rate",
+            "color_learning_rate","gradient_clip_norm",
             "base_huber_iterations","base_frame_batch_size",
-            "adam_beta1","adam_beta2",
-            "adam_epsilon","warp_identity_epsilon"},
+            "adam_beta1","adam_beta2","adam_epsilon",
+            "evaluation_points_per_frame"},
+        "measurement":{
+            "full_visibility_threshold","minimum_visible_fraction",
+            "prior_logit_limit"},
         "loss":{
-            "identity_weight","temporal_weight","cycle_weight",
-            "minimum_crop_weight"},
-        "sequence":{
-            "cycles_per_video","cycle_sample_frames",
-            "cycle_endpoint_frames","maximum_sequence_gap"},
+            "synthetic_regularization_weight","temporal_weight",
+            "warp_distillation_weight","frame_quality_full_confidence",
+            "minimum_frame_quality_weight","appearance_supervision_weight",
+            "appearance_score_clip"},
+        "sequence":{"maximum_sequence_gap"},
+        "ablation":{"use_appearance_memory","use_recurrent_history",
+                    "use_local_geometry"},
         "sample_filter":{"erode_pixels"},
-        "runtime":{"online_gain_bias_enabled"},
     }
     for name,value in (("neural_field",field),("training",training),
-                       ("loss",loss),("sequence",sequence),
-                       ("sample_filter",sample_filter),("runtime",runtime)):
+                       ("measurement",measurement),("loss",loss),("sequence",sequence),
+                       ("ablation",ablation),("sample_filter",sample_filter)):
         extra=set(value)-known[name]
         if extra:
             raise ConfigError(
@@ -465,6 +495,12 @@ def parse_direct_fit_s_config(lightfield: Mapping[str,Any]) -> DirectFitSConfig:
             raise ConfigError(f"{section_name}.{name} 必须是有限{qualifier}数")
         return float(value)
 
+    def boolean(section: Mapping[str,Any],name: str,default: bool) -> bool:
+        value=section.get(name,default)
+        if not isinstance(value,bool):
+            raise ConfigError(f"{section_name}.{name} 必须是布尔值")
+        return value
+
     frequencies=field.get("frequencies",[1,2,4,8,16,32,64])
     if not isinstance(frequencies,(list,tuple)) or not frequencies \
             or any(not isinstance(value,Real) or isinstance(value,bool)
@@ -472,14 +508,6 @@ def parse_direct_fit_s_config(lightfield: Mapping[str,Any]) -> DirectFitSConfig:
             or not np.isfinite(frequencies).all() \
             or any(float(value)<=0 for value in frequencies):
         raise ConfigError("direct_fit_s frequencies 必须是非空有限正数列表")
-    trusted_fraction=number(
-        training,"trusted_clip_fraction",.5,allow_zero=True)
-    if trusted_fraction>1:
-        raise ConfigError("direct_fit_s.trusted_clip_fraction 必须位于 [0,1]")
-    online_gain_bias=runtime.get("online_gain_bias_enabled",False)
-    if not isinstance(online_gain_bias,bool):
-        raise ConfigError(
-            "direct_fit_s.runtime.online_gain_bias_enabled 必须是布尔值")
     result=DirectFitSConfig(
         coordinate_frequencies=tuple(float(value) for value in frequencies),
         geometry_descriptor_rows=integer(
@@ -490,62 +518,116 @@ def parse_direct_fit_s_config(lightfield: Mapping[str,Any]) -> DirectFitSConfig:
             field,"geometry_latent_dimensions",64),
         geometry_pca_dimensions=integer(field,"geometry_pca_dimensions",32),
         gru_hidden_dimensions=integer(field,"gru_hidden_dimensions",64),
+        appearance_descriptor_rows=integer(
+            field,"appearance_descriptor_rows",48,minimum=4),
+        appearance_descriptor_columns=integer(
+            field,"appearance_descriptor_columns",24,minimum=4),
+        appearance_pca_dimensions=integer(
+            field,"appearance_pca_dimensions",96),
+        appearance_minimum_coverage=number(
+            field,"appearance_minimum_coverage",.8),
+        appearance_memory_neighbors=integer(
+            field,"appearance_memory_neighbors",4),
+        appearance_memory_epsilon=number(
+            field,"appearance_memory_epsilon",1e-6),
         color_trunk_width=integer(field,"color_trunk_width",224),
         color_trunk_layers=integer(field,"color_trunk_layers",4),
         color_head_width=integer(field,"color_head_width",128),
         color_head_layers=integer(field,"color_head_layers",2),
-        color_pretrain_steps=integer(
-            training,"color_pretrain_steps",2500,minimum=0),
-        warp_train_steps=integer(training,"warp_train_steps",2500,minimum=0),
-        joint_finetune_steps=integer(
-            training,"joint_finetune_steps",2500,minimum=0),
-        clip_length=integer(training,"clip_length",16,minimum=2),
+        synthetic_warp_steps=integer(
+            training,"synthetic_warp_steps",2500),
+        warp_alignment_steps=integer(
+            training,"warp_alignment_steps",2500),
+        appearance_train_steps=integer(
+            training,"appearance_train_steps",4000),
+        color_train_steps=integer(training,"color_train_steps",2500),
+        color_checkpoint_interval=integer(
+            training,"color_checkpoint_interval",250),
+        color_monitor_batch_count=integer(
+            training,"color_monitor_batch_count",8),
+        clip_length=integer(training,"clip_length",16,minimum=3),
+        warmup_frames=integer(training,"warmup_frames",64,minimum=0),
         clip_batch_size=integer(training,"clip_batch_size",2,minimum=2),
         points_per_frame=integer(training,"points_per_frame",256),
-        trusted_clip_fraction=trusted_fraction,
-        color_pretrain_learning_rate=number(
-            training,"color_pretrain_learning_rate",8e-4),
+        synthetic_sequence_count=integer(
+            training,"synthetic_sequence_count",256),
+        synthetic_min_visible_fraction=number(
+            training,"synthetic_min_visible_fraction",.35),
+        synthetic_warp_learning_rate=number(
+            training,"synthetic_warp_learning_rate",8e-4),
         warp_learning_rate=number(training,"warp_learning_rate",4e-4),
-        joint_learning_rate=number(training,"joint_learning_rate",2e-4),
+        appearance_learning_rate=number(
+            training,"appearance_learning_rate",4e-4),
+        color_learning_rate=number(training,"color_learning_rate",4e-4),
         gradient_clip_norm=number(training,"gradient_clip_norm",1.),
         adam_beta1=number(training,"adam_beta1",.9),
         adam_beta2=number(training,"adam_beta2",.999),
         adam_epsilon=number(training,"adam_epsilon",1e-8),
-        warp_identity_epsilon=number(
-            training,"warp_identity_epsilon",1e-3),
         base_huber_iterations=integer(
             training,"base_huber_iterations",5),
         base_frame_batch_size=integer(
             training,"base_frame_batch_size",8),
-        identity_weight=number(loss,"identity_weight",5.,allow_zero=True),
+        full_visibility_threshold=number(
+            measurement,"full_visibility_threshold",.97),
+        minimum_visible_fraction=number(
+            measurement,"minimum_visible_fraction",.35),
+        measurement_prior_logit_limit=number(
+            measurement,"prior_logit_limit",4.),
+        synthetic_regularization_weight=number(
+            loss,"synthetic_regularization_weight",.02,allow_zero=True),
         temporal_weight=number(loss,"temporal_weight",.25,allow_zero=True),
-        cycle_weight=number(loss,"cycle_weight",1.,allow_zero=True),
-        minimum_crop_weight=number(
-            loss,"minimum_crop_weight",.02,allow_zero=True),
-        cycles_per_video=integer(sequence,"cycles_per_video",1),
-        cycle_sample_frames=integer(
-            sequence,"cycle_sample_frames",32,minimum=2),
-        cycle_endpoint_frames=integer(
-            sequence,"cycle_endpoint_frames",3),
+        warp_distillation_weight=number(
+            loss,"warp_distillation_weight",1.,allow_zero=True),
+        appearance_supervision_weight=number(
+            loss,"appearance_supervision_weight",.005,allow_zero=True),
+        appearance_score_clip=number(loss,"appearance_score_clip",3.),
+        frame_quality_full_confidence=number(
+            loss,"frame_quality_full_confidence",.25),
+        minimum_frame_quality_weight=number(
+            loss,"minimum_frame_quality_weight",.2),
+        use_appearance_memory=boolean(
+            ablation,"use_appearance_memory",True),
+        use_recurrent_history=boolean(
+            ablation,"use_recurrent_history",True),
+        use_local_geometry=boolean(
+            ablation,"use_local_geometry",True),
         maximum_sequence_gap=integer(
             sequence,"maximum_sequence_gap",1,minimum=1),
+        evaluation_points_per_frame=integer(
+            training,"evaluation_points_per_frame",2048),
         sample_erode_pixels=integer(
             sample_filter,"erode_pixels",4,minimum=0),
         session_correction_max_deviation=number(
-            direct,"session_correction_max_deviation",.30),
-        online_gain_bias_enabled=online_gain_bias)
-    if result.color_pretrain_steps+result.warp_train_steps \
-            +result.joint_finetune_steps<1:
-        raise ConfigError("direct_fit_s 至少需要一个训练 step")
+            direct,"session_correction_max_deviation",.30))
     if result.adam_beta1>=1 or result.adam_beta2>=1:
         raise ConfigError("direct_fit_s Adam beta 必须位于 (0,1)")
-    if result.warp_identity_epsilon>=.5:
+    if result.color_checkpoint_interval>result.color_train_steps:
         raise ConfigError(
-            "direct_fit_s.warp_identity_epsilon 必须小于 0.5")
-    if result.cycle_endpoint_frames*2>result.cycle_sample_frames:
+            "direct_fit_s color_checkpoint_interval 不能大于 color_train_steps")
+    if result.full_visibility_threshold>1:
         raise ConfigError(
-            "direct_fit_s.cycle_endpoint_frames 的两端总数不能大于 "
-            "cycle_sample_frames")
+            "direct_fit_s.full_visibility_threshold 必须不大于 1")
+    if result.frame_quality_full_confidence>1 \
+            or result.minimum_frame_quality_weight>1:
+        raise ConfigError(
+            "direct_fit_s 帧质量 confidence/weight 必须不大于 1")
+    appearance_feature_count=(result.appearance_descriptor_rows
+                              *result.appearance_descriptor_columns*3)
+    if result.appearance_pca_dimensions>appearance_feature_count:
+        raise ConfigError(
+            "direct_fit_s appearance_pca_dimensions 不能大于外观描述维数")
+    if result.appearance_minimum_coverage>1:
+        raise ConfigError(
+            "direct_fit_s appearance_minimum_coverage 必须不大于 1")
+    if result.minimum_visible_fraction>=result.full_visibility_threshold:
+        raise ConfigError(
+            "direct_fit_s.minimum_visible_fraction 必须小于 "
+            "full_visibility_threshold")
+    if not result.minimum_visible_fraction \
+            <=result.synthetic_min_visible_fraction<1:
+        raise ConfigError(
+            "direct_fit_s.synthetic_min_visible_fraction 必须位于 "
+            "[minimum_visible_fraction,1) 区间")
     return result
 
 

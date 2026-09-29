@@ -177,22 +177,58 @@ class ReconstructionGridConfigTest(unittest.TestCase):
 
     def test_direct_fit_s_sequence_and_runtime_config_are_validated(self):
         parsed=parse_direct_fit_s_config({"direct_fit_s":{
-            "neural_field":{"gru_hidden_dimensions":17},
-            "training":{"clip_length":8,"clip_batch_size":2},
-            "sequence":{"cycles_per_video":2,"cycle_sample_frames":10,
-                        "cycle_endpoint_frames":2},
-            "runtime":{"online_gain_bias_enabled":False}}})
-        self.assertEqual(parsed.gru_hidden_dimensions,17)
+            "neural_field":{"gru_hidden_dimensions":128,
+                            "appearance_descriptor_rows":16,
+                            "appearance_descriptor_columns":8,
+                            "appearance_pca_dimensions":24},
+            "measurement":{"full_visibility_threshold":.96,
+                           "minimum_visible_fraction":.3,
+                           "prior_logit_limit":3.5},
+            "training":{"clip_length":8,"warmup_frames":12,
+                        "clip_batch_size":2,
+                        "color_train_steps":100,
+                        "color_checkpoint_interval":20,
+                        "color_monitor_batch_count":3,
+                        "synthetic_min_visible_fraction":.4},
+            "loss":{"warp_distillation_weight":2.5,
+                    "frame_quality_full_confidence":.3,
+                    "minimum_frame_quality_weight":.1,
+                    "appearance_supervision_weight":.02,
+                    "appearance_score_clip":2.5},
+            "sequence":{"maximum_sequence_gap":5}}})
+        self.assertEqual(parsed.gru_hidden_dimensions,128)
+        self.assertEqual(parsed.appearance_pca_dimensions,24)
         self.assertEqual(parsed.clip_length,8)
-        self.assertEqual(parsed.cycles_per_video,2)
-        self.assertFalse(parsed.online_gain_bias_enabled)
-        with self.assertRaisesRegex(ConfigError,"online_gain_bias_enabled"):
+        self.assertEqual(parsed.warmup_frames,12)
+        self.assertEqual(parsed.color_checkpoint_interval,20)
+        self.assertEqual(parsed.color_monitor_batch_count,3)
+        self.assertAlmostEqual(parsed.measurement_prior_logit_limit,3.5)
+        self.assertAlmostEqual(parsed.warp_distillation_weight,2.5)
+        self.assertAlmostEqual(parsed.frame_quality_full_confidence,.3)
+        self.assertAlmostEqual(parsed.minimum_frame_quality_weight,.1)
+        self.assertAlmostEqual(parsed.appearance_supervision_weight,.02)
+        self.assertAlmostEqual(parsed.appearance_score_clip,2.5)
+        self.assertEqual(parsed.maximum_sequence_gap,5)
+        with self.assertRaisesRegex(ConfigError,"未知字段"):
             parse_direct_fit_s_config({"direct_fit_s":{
-                "runtime":{"online_gain_bias_enabled":1}}})
-        with self.assertRaisesRegex(ConfigError,"两端总数"):
+                "runtime":{"online_gain_bias_enabled":False}}})
+        with self.assertRaisesRegex(ConfigError,"minimum_visible_fraction"):
             parse_direct_fit_s_config({"direct_fit_s":{
-                "sequence":{"cycle_sample_frames":4,
-                            "cycle_endpoint_frames":3}}})
+                "measurement":{"full_visibility_threshold":.8,
+                               "minimum_visible_fraction":.9}}})
+        with self.assertRaisesRegex(ConfigError,"未知字段"):
+            parse_direct_fit_s_config({"direct_fit_s":{
+                "loss":{"minimum_crop_weight":.02}}})
+        with self.assertRaisesRegex(ConfigError,"warp_distillation_weight"):
+            parse_direct_fit_s_config({"direct_fit_s":{
+                "loss":{"warp_distillation_weight":-1}}})
+        with self.assertRaisesRegex(ConfigError,"帧质量"):
+            parse_direct_fit_s_config({"direct_fit_s":{
+                "loss":{"minimum_frame_quality_weight":1.1}}})
+        with self.assertRaisesRegex(ConfigError,"color_checkpoint_interval"):
+            parse_direct_fit_s_config({"direct_fit_s":{
+                "training":{"color_train_steps":10,
+                            "color_checkpoint_interval":11}}})
 
     def calibration(self,directory: str) -> Path:
         path=Path(directory)/"camera.yaml"

@@ -493,9 +493,6 @@ def _make_residual_renderer(
             else parse_direct_fit_s_config(lightfield_cfg))
         session_saturation=255
         session_erode_pixels=sample_config.sample_erode_pixels
-    direct_s_online_gain_bias=(
-        sample_config.online_gain_bias_enabled
-        if model.background_method=="direct_fit_s" else True)
     score_huber_delta=float(runtime.get("residual_score_huber_delta",.04))
     score_huber_iterations=int(runtime.get("residual_score_huber_iterations",5))
     if score_huber_delta<=0 or score_huber_iterations<1:
@@ -550,8 +547,7 @@ def _make_residual_renderer(
                     b_texture.shape[:2],xyz,model)
             neural_image,_=sample_residual_correction_jax(
                 coordinate_image,neural_texture,m_textures[:0],valid)
-            if model.background_method=="direct_fit_s" \
-                    and not direct_s_online_gain_bias:
+            if model.background_method=="direct_fit_s":
                 gain=jnp.ones((3,),jnp.float32)
                 bias=jnp.zeros((3,),jnp.float32)
                 weights=valid.astype(jnp.float32)
