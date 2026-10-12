@@ -1,0 +1,15 @@
+{
+  "camera_index": 0,
+  "image_size": [640, 480],
+  "camera_file": "data/camera_params.npz",
+  "template_file": "data/template_points.csv",
+  "solver": {
+    "pixel_sigma": 0.5,
+    "metric_sigma": 0.015,
+    "temporal_sigma_mm": 3.0,
+    "max_nfev": 35,
+    "initialization_nfev": 70,
+    "max_reprojection_px": 1.5,
+    "max_metric_error": 0.08
+  }
+}

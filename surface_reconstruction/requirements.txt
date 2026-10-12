@@ -1,0 +1,4 @@
+# Validated on Windows x64, Python 3.13.
+numpy==2.5.3
+scipy==1.18.1
+opencv-python==5.0.0.93
